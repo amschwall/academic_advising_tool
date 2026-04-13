@@ -1,0 +1,304 @@
+TEST-DRIVEN DEVELOPMENT PROMPTING STRATEGY FOR ACADEMIC ADVISING PLATFORM
+================================================================================
+
+PHASE 1: PROJECT FOUNDATION & SETUP
+================================================================================
+
+PROMPT 1: Project Initialization
+---------------------------------
+Create a Next.js 14 project with TypeScript, Tailwind CSS, and the following structure:
+- App router architecture
+- PostgreSQL database with Prisma ORM
+- Supabase for authentication
+- Zustand for state management
+- Initial folder structure: /app, /components, /lib, /types, /tests
+
+Write setup tests that verify:
+- Next.js dev server starts successfully
+- Database connection is established
+- Environment variables are loaded correctly
+
+
+PHASE 2: DATA LAYER (TDD FROM BOTTOM UP)
+================================================================================
+
+PROMPT 2: Database Schema & Tests
+----------------------------------
+Write Prisma schema for:
+- Courses (code, title, credits, description, department, coll_attributes)
+- Prerequisites (course relationships)
+- Students (major, minor, completed_courses)
+- Schedules (student plans)
+
+First, write integration tests for:
+- Creating/reading course records
+- Querying courses by department/COLL attributes
+- Prerequisite chain validation
+- Student course completion tracking
+
+Then implement the schema and CRUD operations to pass these tests.
+
+
+PROMPT 3: Web Scraper with Tests
+---------------------------------
+Build a Playwright scraper for W&M Banner course schedules.
+
+Test requirements:
+- Mock HTML fixtures from Banner pages
+- Unit tests for parsing course codes, titles, times, professors
+- Integration test that scrapes and stores 1 semester of data
+- Error handling for missing/malformed data
+
+Implement scraper to pass all tests. Target: Computer Science department first.
+
+
+PHASE 3: BUSINESS LOGIC LAYER
+================================================================================
+
+PROMPT 4: Requirement Validation Engine
+----------------------------------------
+Create a rule-based validator for degree requirements.
+
+Write tests first:
+- Test COLL requirement checking (e.g., student needs 2 more COLL 200 courses)
+- Test major requirement validation (CS major needs CSCI 141, 241, 303...)
+- Test prerequisite chains (can't take CSCI 303 without CSCI 241)
+- Test credit hour limits (max 18 credits/semester)
+- Test time conflict detection
+
+Then implement the validation engine to pass these tests.
+
+
+PROMPT 5: Schedule Generation Algorithm
+----------------------------------------
+Build a 4-year schedule generator.
+
+Test cases:
+- Generate valid 8-semester plan for CS major with 0 completed courses
+- Respect prerequisites (no taking courses before prereqs)
+- Distribute COLL requirements across semesters
+- Handle course availability (only offered fall/spring)
+- Reject invalid plans (return errors, not partial schedules)
+
+Implement algorithm using constraint satisfaction approach.
+
+
+PHASE 4: AI INTEGRATION LAYER
+================================================================================
+
+PROMPT 6: Claude API Integration with Mocks
+--------------------------------------------
+Set up Anthropic Claude API integration for course recommendations.
+
+Write tests with mocked API responses:
+- Mock successful recommendation responses
+- Test prompt construction for user interests
+- Test parsing of Claude's JSON responses
+- Test error handling (rate limits, timeouts)
+- Test that recommendations are validated against actual course catalog
+
+Implement Claude integration to pass tests.
+
+
+PROMPT 7: AI Validation Layer
+------------------------------
+Create a wrapper that validates all AI outputs.
+
+Test that:
+- AI-recommended courses exist in database
+- AI-generated schedules meet all requirements
+- AI suggestions respect prerequisites
+- Hallucinated courses are caught and filtered out
+- Invalid schedules are rejected with helpful error messages
+
+Implement validation wrapper around Claude API.
+
+
+PHASE 5: API ENDPOINTS (CONTRACT-FIRST TDD)
+================================================================================
+
+PROMPT 8: REST API Tests & Implementation
+------------------------------------------
+Define API contract and write integration tests:
+
+POST /api/courses/search
+- Test filtering by department, COLL attributes
+- Test pagination
+- Test empty results
+
+POST /api/schedule/generate
+- Test with valid student profile
+- Test with invalid inputs (missing major)
+- Test prerequisite violations
+
+GET /api/student/progress
+- Test requirement completion calculation
+- Test missing data handling
+
+Implement endpoints to satisfy the test contracts.
+
+
+PHASE 6: FRONTEND COMPONENTS (COMPONENT TDD)
+================================================================================
+
+PROMPT 9: Course Search Component
+----------------------------------
+Build course search interface with React Testing Library tests:
+
+Test that:
+- Search input filters courses by title/code
+- Department dropdown filters correctly
+- COLL attribute checkboxes work
+- Results display course details
+- Loading states show during search
+- Empty states display when no results
+
+Implement component to pass all tests.
+
+
+PROMPT 10: Drag-and-Drop Planner
+---------------------------------
+Create drag-and-drop schedule interface.
+
+Test scenarios:
+- Dragging course from search to semester slot
+- Removing course from schedule
+- Preventing invalid drops (time conflicts)
+- Visual feedback during drag
+- State persistence after drop
+
+Use @dnd-kit or react-beautiful-dnd, implement with full test coverage.
+
+
+PROMPT 11: Requirement Progress Tracker
+----------------------------------------
+Build visual requirement tracker component.
+
+Tests:
+- Displays COLL requirements with completion status
+- Shows major requirements progress bar
+- Updates in real-time when courses added/removed
+- Highlights missing requirements
+- Shows credit count progress
+
+Implement component driven by tests.
+
+
+PHASE 7: AI CHAT INTERFACE
+================================================================================
+
+PROMPT 12: Conversational Planning UI
+--------------------------------------
+Create chat interface for natural language planning.
+
+Test:
+- Message sending/receiving
+- Streaming responses from Claude
+- Displaying course recommendations
+- Converting recommendations to draggable course cards
+- Error message display
+- Loading states
+
+Implement chat UI to pass tests.
+
+
+PHASE 8: INTEGRATION & E2E TESTS
+================================================================================
+
+PROMPT 13: End-to-End User Flows
+---------------------------------
+Write Playwright E2E tests for complete user journeys:
+
+1. New student onboarding flow:
+   - Select major/minor
+   - Add completed courses
+   - Generate 4-year plan
+   - Verify plan meets all requirements
+
+2. Course planning flow:
+   - Search for courses
+   - Drag to schedule
+   - Get AI recommendations
+   - Save schedule
+
+3. What-if scenario:
+   - Ask "What if I switch to a CS minor?"
+   - Verify AI generates new valid plan
+
+Run tests, fix failures, achieve green suite.
+
+
+PHASE 9: VALIDATION & EDGE CASES
+================================================================================
+
+PROMPT 14: Adversarial Testing
+-------------------------------
+Create tests for edge cases and failure modes:
+
+- Student with 60+ completed credits (senior)
+- Double major planning
+- Study abroad semester (no courses)
+- Course no longer offered
+- Prerequisites changed mid-degree
+- Transfer credits
+- Maximum attempts at prerequisite validation
+- Concurrent API requests
+- Database transaction rollbacks
+
+Implement robust error handling to pass all edge case tests.
+
+
+PHASE 10: PERFORMANCE & OPTIMIZATION
+================================================================================
+
+PROMPT 15: Performance Tests
+-----------------------------
+Add performance benchmarks:
+
+- Schedule generation completes in < 2 seconds
+- Course search returns in < 200ms
+- AI recommendations stream in < 5 seconds
+- Database queries use proper indexes
+- Page load times < 1 second
+
+Profile, optimize, and pass performance tests.
+
+
+KEY TDD PRINCIPLES TO EMPHASIZE IN PROMPTS
+================================================================================
+
+1. RED-GREEN-REFACTOR: Always write failing tests first
+2. ONE TEST AT A TIME: Don't move on until current test passes
+3. MINIMAL IMPLEMENTATION: Write just enough code to pass
+4. TEST ISOLATION: Each test should be independent
+5. MEANINGFUL ASSERTIONS: Test behavior, not implementation
+6. MOCK EXTERNAL DEPENDENCIES: Use fixtures for Banner HTML, Claude API
+
+
+EXAMPLE PROMPT FORMAT
+================================================================================
+
+[CONTEXT]: We're building [feature] for the academic advising platform.
+
+[TEST FIRST]: Write comprehensive tests for:
+- [specific scenario 1]
+- [specific scenario 2]
+- [edge case]
+
+[REQUIREMENTS]: Tests must:
+- Use [testing framework]
+- Cover happy path + error cases
+- Be deterministic and isolated
+
+[IMPLEMENTATION]: Only after tests are written and failing, implement the 
+minimum code to make them pass.
+
+[VERIFY]: Run tests, show results, refactor if needed while keeping tests green.
+
+
+CONCLUSION
+================================================================================
+
+This approach ensures every feature is validated, prevents regressions, and 
+creates a robust, maintainable codebase from day one. Each prompt builds on 
+the previous one, creating a solid foundation before moving to the next layer.

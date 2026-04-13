@@ -1,0 +1,396 @@
+REFINED TDD PROMPT PLAN (UPDATED)
+======================================================
+
+GLOBAL CONVENTIONS
+------------------------------------------------------
+- Testing stack:
+  - Backend/unit/integration: Jest
+  - API: Jest + Supertest
+  - Database: Postgres test DB + per-test transaction rollback
+  - Frontend components: React Testing Library + Jest
+  - E2E: Playwright
+
+- AI integration:
+  - All tests mock a ClaudeClient wrapper class.
+
+- File output format:
+  - Each file begins with: // file: path/to/file.ts
+
+- Data realism:
+  - Use mock/placeholder data for COLL, major requirements, catalog, prerequisites.
+
+- TDD discipline:
+  - Tests first → failing → minimal implementation → passing → refactor.
+
+- Determinism:
+  - No unseeded randomness.
+  - No real network calls.
+  - Each test isolated.
+
+- Database tests:
+  - Dedicated test DB.
+  - Wrap each test in a transaction and roll back.
+
+- Auth model:
+  - Simulated school SSO (OAuth-style flow via Supabase Auth)
+
+- Requirement model:
+  - Students are locked to their catalog year
+
+- Scheduler:
+  - Constraint-based + preference-aware optimization
+
+- Caching:
+  - Redis-style abstraction layer (mocked in tests)
+
+- AI behavior:
+  - Invalid AI outputs are rejected (never silently corrected)
+
+------------------------------------------------------
+
+STANDARD PER-PHASE TEMPLATE
+---------------------------
+[CONTEXT]  
+Explain the feature and its role in the system.
+
+[TEST FIRST]  
+Write tests only:
+- Use the specified testing stack.
+- Include happy path, error cases, edge cases.
+- Use mock data where real data is unknown.
+- Output each file with // file: ... header.
+- Do NOT write implementation yet.
+
+[STOP]  
+Stop after tests. Wait for confirmation.
+
+[IMPLEMENTATION]  
+After confirmation:
+- Write minimal implementation to pass tests.
+- No extra features.
+- Output each file with // file: ... header.
+
+[VERIFY]  
+- Show simulated test results.
+- Fix failures minimally.
+- Refactor while keeping tests green.
+
+======================================================
+PHASE 1 — PROJECT FOUNDATION & SETUP
+======================================================
+[CONTEXT]  
+Initialize Next.js 14 app with TypeScript, Tailwind, Prisma, Supabase Auth, Zustand.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Health check route returns 200 { status: 'ok' }
+- Prisma DB connection works
+- Missing env vars throw descriptive errors
+- Required env vars validated at startup
+
+STOP after tests.
+
+======================================================
+PHASE 2 — AUTHENTICATION (SSO SIMULATION)
+======================================================
+[CONTEXT]  
+Simulate university SSO using Supabase OAuth-style login.
+
+[TEST FIRST]  
+Write Jest + Supertest tests for:
+- Successful login returns session
+- Invalid token rejected
+- Session persists across requests
+- Logout clears session
+- Unauthorized access → 401
+
+STOP after tests.
+
+======================================================
+PHASE 3 — AUTHORIZATION & ROLES
+======================================================
+[CONTEXT]  
+Role-based access control for students, advisors, admins.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Student can only access own data
+- Advisor can access assigned students
+- Admin can access all data
+- Unauthorized role access → 403
+- Route protection middleware enforcement
+
+STOP after tests.
+
+======================================================
+PHASE 4 — DATA LAYER: PRISMA SCHEMA & VERSIONING
+======================================================
+[CONTEXT]  
+Core models with catalog-year versioning.
+
+[TEST FIRST]  
+Write Jest integration tests for:
+- Creating/reading courses
+- Querying by department, COLL attributes
+- Student tied to catalog year
+- Requirements differ across catalog years
+- Old requirements preserved after updates
+- Student completed course tracking
+- Schedule creation and linking
+
+STOP after tests.
+
+======================================================
+PHASE 5 — WEB SCRAPER (STATIC FIXTURES)
+======================================================
+[CONTEXT]  
+Playwright scraper using static Banner HTML fixtures.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Parsing course fields from HTML fixtures
+- Handling missing/malformed fields
+- Integration test storing scraped semester data
+- Graceful failure on malformed HTML
+
+STOP after tests.
+
+======================================================
+PHASE 6 — REQUIREMENT VALIDATION ENGINE
+======================================================
+[CONTEXT]  
+Rule-based validator (source of truth).
+
+[TEST FIRST]  
+Write Jest tests for:
+- COLL requirement checking
+- Major requirement validation
+- Prerequisite enforcement
+- Credit hour limits
+- Time conflict detection
+- Catalog-year-specific validation
+
+STOP after tests.
+
+======================================================
+PHASE 7 — SCHEDULE GENERATION ALGORITHM (ADVANCED)
+======================================================
+[CONTEXT]  
+4-year planner with constraints + preferences.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Valid 8-semester plan
+- Prerequisite ordering
+- COLL distribution
+- Course availability constraints
+- Preference handling:
+  - Avoid early classes
+  - No Friday classes
+- Balanced workload across semesters
+- Invalid plan → structured error with reason
+
+STOP after tests.
+
+======================================================
+PHASE 8 — CACHING LAYER (REDIS-STYLE)
+======================================================
+[CONTEXT]  
+Abstract caching for performance.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Cache hit returns cached result
+- Cache miss computes and stores value
+- Cache invalidation after data updates
+- Schedule generation uses cache
+- TTL expiration behavior
+
+STOP after tests.
+
+======================================================
+PHASE 9 — CLAUDE API INTEGRATION (MOCKED)
+======================================================
+[CONTEXT]  
+LLM wrapper for recommendations.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Prompt construction
+- Mocked responses
+- JSON parsing
+- Timeout handling
+- Rate limiting
+- Handling vague input (“I like science”)
+
+STOP after tests.
+
+======================================================
+PHASE 10 — AI VALIDATION LAYER (STRICT)
+======================================================
+[CONTEXT]  
+Reject invalid AI outputs.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Reject nonexistent courses
+- Reject invalid prerequisite chains
+- Reject impossible schedules
+- Return structured validation errors
+- Ensure NO auto-correction occurs
+
+STOP after tests.
+
+======================================================
+PHASE 11 — API ENDPOINTS (CONTRACT-FIRST)
+======================================================
+[CONTEXT]  
+Expose backend via REST.
+
+[TEST FIRST]  
+Write Jest + Supertest tests for:
+- /api/courses/search:
+  - Filtering, pagination, empty results
+- /api/schedule/generate:
+  - Valid plan
+  - Invalid input
+  - Preference handling
+- /api/student/progress:
+  - Requirement tracking
+- Auth + role enforcement on all routes
+
+STOP after tests.
+
+======================================================
+PHASE 12 — COURSE SEARCH COMPONENT
+======================================================
+[CONTEXT]  
+Frontend search UI.
+
+[TEST FIRST]  
+Write React Testing Library tests for:
+- Filtering by title/code
+- Department dropdown
+- COLL filters
+- Loading, empty, error states
+- Displaying course details
+
+STOP after tests.
+
+======================================================
+PHASE 13 — DRAG-AND-DROP PLANNER
+======================================================
+[CONTEXT]  
+Interactive schedule builder.
+
+[TEST FIRST]  
+Write React Testing Library tests for:
+- Drag into semester
+- Remove course
+- Prevent invalid drops
+- Visual feedback
+- Zustand state persistence
+
+STOP after tests.
+
+======================================================
+PHASE 14 — REQUIREMENT PROGRESS TRACKER
+======================================================
+[CONTEXT]  
+Visual requirement tracking.
+
+[TEST FIRST]  
+Write React Testing Library tests for:
+- Completion display
+- Real-time updates
+- Missing requirement highlighting
+- Credit progress
+
+STOP after tests.
+
+======================================================
+PHASE 15 — AI CHAT INTERFACE
+======================================================
+[CONTEXT]  
+Conversational planner.
+
+[TEST FIRST]  
+Write React Testing Library tests for:
+- Send/receive messages
+- Streaming responses (mocked)
+- Recommendation cards
+- Convert to draggable items
+- Loading + error states
+
+STOP after tests.
+
+======================================================
+PHASE 16 — OBSERVABILITY (LOGGING & METRICS)
+======================================================
+[CONTEXT]  
+System monitoring.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Logging schedule failures
+- Logging AI validation errors
+- Metrics for:
+  - schedule generation time
+  - API latency
+- Structured logs format
+
+STOP after tests.
+
+======================================================
+PHASE 17 — END-TO-END FLOWS (PLAYWRIGHT)
+======================================================
+[CONTEXT]  
+Full user journeys.
+
+[TEST FIRST]  
+Write Playwright tests for:
+1. New student onboarding (SSO login)
+2. Full course planning flow
+3. Preference-based schedule generation
+4. What-if scenario (add/remove major)
+
+STOP after tests.
+
+======================================================
+PHASE 18 — ADVERSARIAL & EDGE CASE TESTING
+======================================================
+[CONTEXT]  
+Stress system.
+
+[TEST FIRST]  
+Write Jest tests for:
+- Senior with 60+ credits
+- Double major
+- Study abroad
+- Course removed from catalog
+- Changed prerequisites (version-safe)
+- Transfer credits
+- Concurrent API requests
+- Transaction rollback failures
+
+STOP after tests.
+
+======================================================
+PHASE 19 — PERFORMANCE & OPTIMIZATION
+======================================================
+[CONTEXT]  
+Performance guarantees.
+
+[TEST FIRST]  
+Write Jest + Playwright tests for:
+- Schedule generation < 2s
+- Course search < 200ms
+- AI response < 5s
+- Cache improves performance
+- Page load < 1s
+
+STOP after tests.
+
+======================================================
+END OF FILE
+======================================================
