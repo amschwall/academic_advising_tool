@@ -8,3 +8,138 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Season {
+  FALL
+  SPRING
+  SUMMER
+  WINTER
+}
+
+enum RequirementType {
+  COLL
+  MAJOR
+  MINOR
+  ELECTIVE
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Student {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  name          String
+  major         String?    @default("Undecided")
+  minor         String?
+  concentration String?
+  year          Int?
+  catalogYear   Int        // matriculation year — determines which requirement set applies
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  schedules     Schedule[]
+}
+
+model Course {
+  id            String              @id @default(cuid())
+  code          String              @unique  // e.g. "CSCI301"
+  title         String
+  credits       Int
+  description   String?
+  department    String
+  // General-education designations (free-text tag for COLL, boolean flags for others)
+  collAttribute String?             // e.g. "COLL 100", "COLL 200", "COLL 300", "COLL 400"; null if not a COLL course
+  alv           Boolean             @default(false) // Arts, Literature & Values
+  nqr           Boolean             @default(false) // Natural, Quantitative & Reasoning
+  csi           Boolean             @default(false) // Culture, Society & Identity
+  prerequisites Prerequisite[]      @relation("CoursePrerequisites")
+  requiredBy    Prerequisite[]      @relation("PrerequisiteFor")
+  scheduleItems ScheduleItem[]
+  requirements  RequirementCourse[]
+  sections      Section[]
+}
+
+model Prerequisite {
+  id             String @id @default(cuid())
+  courseId       String
+  prerequisiteId String
+  course         Course @relation("CoursePrerequisites", fields: [courseId], references: [id])
+  prerequisite   Course @relation("PrerequisiteFor", fields: [prerequisiteId], references: [id])
+
+  @@unique([courseId, prerequisiteId])
+}
+
+model Schedule {
+  id        String         @id @default(cuid())
+  studentId String
+  name      String         // label for this draft (e.g. "Four-Year Plan A")
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  student   Student        @relation(fields: [studentId], references: [id])
+  items     ScheduleItem[]
+}
+
+model ScheduleItem {
+  id         String   @id @default(cuid())
+  scheduleId String
+  courseId   String
+  sectionId  String?  // optional — links to a specific Section CRN offering
+  year       Int      // academic year the course is planned/taken, e.g. 2025
+  season     Season   // FALL | SPRING | SUMMER | WINTER
+  grade      String?  // recorded grade string, e.g. "A", "B+", "C-"; null if not yet taken
+  completed  Boolean  @default(false) // true only when grade is C- (1.7) or better
+  schedule   Schedule @relation(fields: [scheduleId], references: [id])
+  course     Course   @relation(fields: [courseId], references: [id])
+  section    Section? @relation(fields: [sectionId], references: [id])
+
+  @@unique([scheduleId, courseId])
+}
+
+// Requirement rows are immutable once created. New catalog years get new rows;
+// old rows are never modified, preserving historical requirement sets.
+model Requirement {
+  id          String              @id @default(cuid())
+  name        String
+  type        RequirementType
+  catalogYear Int                 // the matriculation year this requirement applies to
+  description String?
+  courses     RequirementCourse[]
+}
+
+model RequirementCourse {
+  requirementId String
+  courseId      String
+  requirement   Requirement @relation(fields: [requirementId], references: [id])
+  course        Course      @relation(fields: [courseId], references: [id])
+
+  @@id([requirementId, courseId])
+}
+
+// ---------------------------------------------------------------------------
+// Section — one row per Banner CRN (a specific offering of a Course)
+// ---------------------------------------------------------------------------
+
+model Section {
+  id         String   @id @default(cuid())
+  crn        String   @unique  // Banner Course Registration Number
+  courseId   String
+  section    String            // section number e.g. "01"
+  term       String            // Banner term code e.g. "202610"
+  year       Int               // calendar year the semester begins
+  season     Season
+  days       String?           // e.g. "MWF", "TR"; null when TBA
+  startTime  String?           // 12-h format e.g. "10:00am"; null when TBA
+  endTime    String?           // 12-h format e.g. "10:50am"; null when TBA
+  location   String?
+  instructor String?
+  capacity   Int?
+  enrolled   Int?
+  status        String         @default("A") // A=open, F=full, C=cancelled
+  course        Course         @relation(fields: [courseId], references: [id])
+  scheduleItems ScheduleItem[]
+}
