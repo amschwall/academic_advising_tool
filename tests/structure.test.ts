@@ -52,6 +52,7 @@ describe("Project structure", () => {
       "tailwind.config.ts",
       "prisma/schema.prisma",
       ".env.test",
+      ".gitignore",
     ];
 
     for (const file of configFiles) {
