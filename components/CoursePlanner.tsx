@@ -40,6 +40,7 @@ interface Course {
   csi?: boolean;
   nqr?: boolean;
   department?: string;
+  majorRestriction?: string | null;
 }
 
 interface Notification {
@@ -81,6 +82,92 @@ function extractCourseLevel(code: string): number {
  * syntheticFallback: synthetic placeholder Course objects keyed by code.
  * The caller must merge these into the courseByCode lookup used for UI placement.
  */
+/**
+ * Returns the set of department codes the student has access to based on their
+ * selected programs. A course whose majorRestriction matches one of these
+ * departments is eligible; all others are filtered out of auto-placed slots.
+ */
+function getMajorDepartments(programs: ProgramDefinition[]): Set<string> {
+  const depts = new Set<string>();
+  for (const p of programs) {
+    for (const req of p.requirements) {
+      if (req.type === "credits" && req.departments) {
+        req.departments.forEach((d) => depts.add(d));
+      }
+      if (req.type === "course") {
+        const m = req.code.match(/^([A-Z]+)/);
+        if (m) depts.add(m[1]);
+      }
+    }
+  }
+  return depts;
+}
+
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ---------------------------------------------------------------------------
+// Calendar helpers
+// ---------------------------------------------------------------------------
+
+const CALENDAR_START_MIN = 6 * 60;   // 6:00 AM
+const CALENDAR_END_MIN   = 22 * 60;  // 10:00 PM
+const CALENDAR_RANGE     = CALENDAR_END_MIN - CALENDAR_START_MIN; // 960 min
+const PX_PER_MIN         = 1;        // 1 px per minute → 60 px/hr, 960 px total
+const UNSCHEDULED_MIN    = 6 * 60 + 30; // 6:30 AM — no real class scheduled here
+const UNSCHEDULED_HEIGHT = 40;       // px height for time-less blocks
+
+const CALENDAR_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"] as const;
+
+/**
+ * Parse a meeting-days string (e.g. "MWF", "TR", "TuTh") into
+ * day-of-week indices: 0 = Mon … 4 = Fri.
+ */
+function parseDays(daysStr: string | null | undefined): number[] {
+  if (!daysStr || daysStr.toUpperCase() === "TBA") return [];
+  const days = new Set<number>();
+  // Replace multi-char tokens first to avoid double-counting single letters.
+  const s = daysStr
+    .replace(/Tu/gi, "\x01")  // Tue placeholder
+    .replace(/Th/gi, "\x02")  // Thu placeholder
+    .replace(/Sa/gi, "")
+    .replace(/Su/gi, "");
+  if (s.includes("\x01"))                              days.add(1); // Tue
+  if (s.includes("\x02") || /R/i.test(s))             days.add(3); // Thu
+  if (/M/i.test(s))                                   days.add(0); // Mon
+  if (/T/i.test(s.replace(/\x01/g, "")))              days.add(1); // bare T = Tue
+  if (/W/i.test(s))                                   days.add(2); // Wed
+  if (/F/i.test(s))                                   days.add(4); // Fri
+  return [...days].sort((a, b) => a - b);
+}
+
+/** Convert "9:00 AM" / "1:30 PM" to total minutes from midnight. */
+function parseTimeToMinutes(timeStr: string | null | undefined): number | null {
+  if (!timeStr) return null;
+  const m = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = parseInt(m[1]);
+  const min = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  if (ampm === "PM" && h !== 12) h += 12;
+  if (ampm === "AM" && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+function formatHour(totalMins: number): string {
+  const h = Math.floor(totalMins / 60);
+  if (h === 0)  return "12 AM";
+  if (h < 12)  return `${h} AM`;
+  if (h === 12) return "12 PM";
+  return `${h - 12} PM`;
+}
+
 function buildRequirementsFromPrograms(
   programs: ProgramDefinition[],
   availableCourses: Course[],
@@ -91,6 +178,14 @@ function buildRequirementsFromPrograms(
   syntheticFallback:    Map<string, Course>;
 } {
   const courseMap         = new Map(availableCourses.map((c) => [c.code, c]));
+  const majorDepts        = getMajorDepartments(programs);
+  // Shuffle once so all catalog-fallback and gen-ed loops pick randomly,
+  // and pre-filter to exclude courses restricted to a major the student isn't in.
+  const shuffledCourses   = shuffle(
+    availableCourses.filter(
+      (c) => !c.majorRestriction || majorDepts.has(c.majorRestriction)
+    )
+  );
   const seenRequired      = new Set<string>();
   const syntheticFallback = new Map<string, Course>();
   const majorRequirements: GeneratorInput["majorRequirements"] = [];
@@ -161,16 +256,40 @@ function buildRequirementsFromPrograms(
             covered += entry.credits;
           }
 
-          // Pick additional matching catalog courses for any shortfall.
-          // Cap at level 400 — graduate courses (500+) must be placed manually.
-          for (const course of availableCourses) {
-            if (covered >= req.credits) break;
-            if (seenRequired.has(course.code)) continue;
-            if (extractCourseLevel(course.code) >= 500) continue;
-            if (req.departments && !req.departments.includes(course.department ?? "")) continue;
-            if (req.minLevel && extractCourseLevel(course.code) < req.minLevel) continue;
-            addRequired(toGenCourse(course));
-            covered += course.credits;
+          if (req.electiveCourses && req.electiveCourses.length > 0) {
+            // Approved elective list defined — shuffle and pick randomly.
+            const shuffled = [...req.electiveCourses].sort(() => Math.random() - 0.5);
+            for (const elec of shuffled) {
+              if (covered >= req.credits) break;
+              if (seenRequired.has(elec.code)) continue;
+              // Prefer DB version (has section info); fall back to static definition.
+              const dbCourse = courseMap.get(elec.code);
+              addRequired(
+                dbCourse
+                  ? toGenCourse(dbCourse)
+                  : { code: elec.code, credits: elec.credits, prerequisiteCodes: [], collAttribute: null, seasons: ["FALL", "SPRING"] as Season[] }
+              );
+              // Add to syntheticFallback if not in DB so the UI can render it
+              if (!dbCourse) {
+                syntheticFallback.set(elec.code, {
+                  code: elec.code, title: elec.title, credits: elec.credits,
+                  prerequisiteCodes: [], sections: [], collAttribute: null,
+                });
+              }
+              covered += elec.credits;
+            }
+          } else {
+            // No approved list — fall back to catalog filtering (shuffled for variety).
+            // Cap at level 400; graduate courses (500+) must be placed manually.
+            for (const course of shuffledCourses) {
+              if (covered >= req.credits) break;
+              if (seenRequired.has(course.code)) continue;
+              if (extractCourseLevel(course.code) >= 500) continue;
+              if (req.departments && !req.departments.includes(course.department ?? "")) continue;
+              if (req.minLevel && extractCourseLevel(course.code) < req.minLevel) continue;
+              addRequired(toGenCourse(course));
+              covered += course.credits;
+            }
           }
         }
         // No-filter requirements (e.g. COLL 100/150 seminars) are never satisfied
@@ -191,7 +310,7 @@ function buildRequirementsFromPrograms(
         let addedCount = 0;
 
         // Cap at level 400 — graduate courses (500+) must be placed manually.
-        for (const course of availableCourses) {
+        for (const course of shuffledCourses) {
           if (addedCount >= req.count) break;
           if (seenRequired.has(course.code)) continue;
           if (extractCourseLevel(course.code) >= 500) continue;
@@ -307,7 +426,8 @@ function PlacedCourseCard({
   course: PlannedCourse;
   semesterId: string;
 }) {
-  const removeCourse = usePlannerStore((s) => s.removeCourse);
+  const removeCourse      = usePlannerStore((s) => s.removeCourse);
+  const setCourseStatus   = usePlannerStore((s) => s.setCourseStatus);
   const [expanded, setExpanded] = useState(false);
 
   const genEdBadges: string[] = [];
@@ -355,6 +475,27 @@ function PlacedCourseCard({
       {/* ── Expanded details ── */}
       {expanded && (
         <div className="border-t border-gray-100 px-3 pb-2.5 pt-2 text-xs text-gray-500 space-y-1.5">
+          {/* Status selector */}
+          <div className="flex items-center gap-1">
+            {(["planned", "in-progress", "completed"] as const).map((s) => {
+              const active = (course.status ?? "planned") === s;
+              const cls = s === "planned"
+                ? active ? "bg-blue-100 text-blue-700 ring-1 ring-blue-300" : "text-gray-400 hover:bg-gray-100"
+                : s === "in-progress"
+                ? active ? "bg-yellow-100 text-yellow-700 ring-1 ring-yellow-300" : "text-gray-400 hover:bg-gray-100"
+                : active ? "bg-green-100 text-green-700 ring-1 ring-green-300" : "text-gray-400 hover:bg-gray-100";
+              return (
+                <button
+                  key={s}
+                  onClick={() => setCourseStatus(semesterId, course.code, s)}
+                  className={`rounded px-2 py-0.5 text-[11px] font-medium capitalize transition-colors ${cls}`}
+                >
+                  {s === "in-progress" ? "In Progress" : s.charAt(0).toUpperCase() + s.slice(1)}
+                </button>
+              );
+            })}
+          </div>
+
           {/* Gen-ed badges */}
           {genEdBadges.length > 0 && (
             <div className="flex flex-wrap gap-1">
@@ -407,6 +548,236 @@ function PlacedCourseCard({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CalendarCourseBlock — a course block on the weekly calendar
+// ---------------------------------------------------------------------------
+
+const BLOCK_CLS: Record<string, string> = {
+  "planned":     "bg-blue-100 border-l-blue-500 text-blue-900",
+  "in-progress": "bg-yellow-100 border-l-yellow-500 text-yellow-900",
+  "completed":   "bg-green-100 border-l-green-600 text-green-900",
+};
+const BLOCK_DEFAULT = "bg-indigo-100 border-l-indigo-500 text-indigo-900";
+
+function CalendarCourseBlock({
+  course,
+  semesterId,
+  topPx,
+  heightPx,
+  unscheduled,
+}: {
+  course: PlannedCourse;
+  semesterId: string;
+  topPx: number;
+  heightPx: number;
+  unscheduled: boolean;
+}) {
+  const removeCourse = usePlannerStore((s) => s.removeCourse);
+  const [open, setOpen] = useState(false);
+  const status = course.status ?? "planned";
+  const colorCls = BLOCK_CLS[status] ?? BLOCK_DEFAULT;
+
+  return (
+    <div
+      className={[
+        "absolute left-0.5 right-0.5 cursor-pointer select-none overflow-visible",
+        "rounded border-l-2 px-1.5 py-0.5 shadow-sm hover:shadow-md transition-shadow",
+        unscheduled ? "opacity-60 border-dashed" : "",
+        colorCls,
+      ].join(" ")}
+      style={{ top: topPx, height: Math.max(heightPx, 18), zIndex: open ? 30 : 10 }}
+      onClick={() => setOpen((v) => !v)}
+      title={`${course.code}: ${course.title}${unscheduled ? " (time TBD)" : ""}`}
+    >
+      <p className="truncate text-[9px] font-bold leading-tight">{course.code}</p>
+      {heightPx >= 26 && (
+        <p className="truncate text-[9px] leading-tight opacity-75">{course.title}</p>
+      )}
+      {unscheduled && heightPx >= 18 && (
+        <p className="text-[8px] opacity-50 leading-tight">TBD</p>
+      )}
+
+      {/* Popover detail card */}
+      {open && (
+        <div
+          className="absolute left-full top-0 z-40 ml-1.5 w-52 rounded-xl bg-white
+                     shadow-xl ring-1 ring-gray-200 p-3 text-xs"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <p className="font-semibold text-gray-800 mb-0.5">{course.title}</p>
+          <p className="text-gray-500 mb-2">{course.code} · {course.credits} cr</p>
+          {course.sections[0] ? (
+            <p className="text-gray-500 leading-relaxed">
+              {course.sections[0].days}{" "}
+              {course.sections[0].startTime && course.sections[0].endTime
+                ? `${course.sections[0].startTime}–${course.sections[0].endTime}`
+                : "Time TBD"}
+              {course.sections[0].location && course.sections[0].location !== "TBA"
+                ? ` · ${course.sections[0].location}`
+                : ""}
+            </p>
+          ) : (
+            <p className="italic text-gray-400">No section info</p>
+          )}
+          <button
+            onClick={() => removeCourse(semesterId, course.code)}
+            className="mt-2.5 text-[11px] text-red-400 hover:text-red-600 transition-colors"
+          >
+            Remove from semester
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// WeeklyCalendar — calendar view for a single semester
+// ---------------------------------------------------------------------------
+
+function WeeklyCalendar({
+  semester,
+  activeCourse,
+}: {
+  semester: Semester;
+  activeCourse: Course | null;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: semester.id });
+  const isPrereqSatisfied = usePlannerStore((s) => s.isPrereqSatisfied);
+  const isInvalid = isOver && activeCourse !== null && !isPrereqSatisfied(semester.id, activeCourse);
+
+  const totalHeight = CALENDAR_RANGE * PX_PER_MIN; // 960 px
+
+  // Build per-day course blocks
+  type BlockInfo = { course: PlannedCourse; topPx: number; heightPx: number; unscheduled: boolean };
+  const coursesByDay: BlockInfo[][] = CALENDAR_DAYS.map(() => []);
+
+  for (const course of semester.courses) {
+    const section = course.sections.find((s) => s.startTime && s.endTime);
+    const startMin = parseTimeToMinutes(section?.startTime) ?? UNSCHEDULED_MIN;
+    const endMin   = parseTimeToMinutes(section?.endTime)   ?? startMin + 50;
+    const days     = section?.days ? parseDays(section.days) : [];
+    const unscheduled = !section?.startTime;
+
+    const topPx    = (startMin - CALENDAR_START_MIN) * PX_PER_MIN;
+    const heightPx = unscheduled ? UNSCHEDULED_HEIGHT : Math.max((endMin - startMin) * PX_PER_MIN, 18);
+
+    // Unscheduled → show only in Monday column so it doesn't clutter all days
+    const targetDays = unscheduled ? [0] : (days.length > 0 ? days : [0, 2, 4]);
+
+    for (const d of targetDays) {
+      if (d >= 0 && d <= 4) {
+        coursesByDay[d].push({ course, topPx, heightPx, unscheduled });
+      }
+    }
+  }
+
+  const hours = Array.from({ length: CALENDAR_RANGE / 60 }, (_, i) => CALENDAR_START_MIN + i * 60);
+
+  return (
+    <div className="relative flex flex-1 flex-col overflow-hidden">
+      {/* ── Day header ─────────────────────────────────────────────────── */}
+      <div className="flex shrink-0 border-b border-gray-200 bg-white">
+        <div className="w-14 shrink-0 border-r border-gray-100 bg-white" />
+        {CALENDAR_DAYS.map((day) => (
+          <div
+            key={day}
+            className="flex-1 border-r border-gray-100 py-2 text-center text-xs font-semibold text-gray-500 last:border-r-0"
+          >
+            {day}
+          </div>
+        ))}
+      </div>
+
+      {/* ── Semester label + drop state ────────────────────────────────── */}
+      <div
+        className={[
+          "shrink-0 border-b px-4 py-1.5 text-xs font-medium transition-colors",
+          isInvalid
+            ? "border-red-200 bg-red-50 text-red-600"
+            : isOver
+            ? "border-green-200 bg-green-50 text-green-700"
+            : "border-gray-100 bg-white text-gray-500",
+        ].join(" ")}
+      >
+        {isInvalid
+          ? "Prerequisite not met — cannot add here"
+          : isOver
+          ? `Drop to add to ${semester.label}`
+          : `${semester.label} · ${semester.courses.reduce((s, c) => s + c.credits, 0)} credits`}
+      </div>
+
+      {/* ── Scrollable grid ────────────────────────────────────────────── */}
+      <div
+        ref={setNodeRef}
+        className={[
+          "flex flex-1 overflow-y-auto transition-colors",
+          isInvalid ? "bg-red-50" : isOver ? "bg-green-50/40" : "bg-white",
+        ].join(" ")}
+      >
+        {/* Time axis */}
+        <div
+          className="relative w-14 shrink-0 border-r border-gray-100 bg-white"
+          style={{ minHeight: totalHeight }}
+        >
+          {hours.map((minFromMidnight) => (
+            <div
+              key={minFromMidnight}
+              className="absolute right-1.5 text-[9px] leading-none text-gray-400"
+              style={{ top: (minFromMidnight - CALENDAR_START_MIN) * PX_PER_MIN - 5 }}
+            >
+              {formatHour(minFromMidnight)}
+            </div>
+          ))}
+        </div>
+
+        {/* Day columns */}
+        {CALENDAR_DAYS.map((day, dayIdx) => (
+          <div
+            key={day}
+            className="relative flex-1 border-r border-gray-100 last:border-r-0"
+            style={{ minHeight: totalHeight }}
+          >
+            {/* Hour and half-hour lines */}
+            {hours.map((minFromMidnight) => (
+              <React.Fragment key={minFromMidnight}>
+                <div
+                  className="absolute left-0 right-0 border-t border-gray-100"
+                  style={{ top: (minFromMidnight - CALENDAR_START_MIN) * PX_PER_MIN }}
+                />
+                <div
+                  className="absolute left-0 right-0 border-t border-gray-50"
+                  style={{ top: (minFromMidnight + 30 - CALENDAR_START_MIN) * PX_PER_MIN }}
+                />
+              </React.Fragment>
+            ))}
+
+            {/* 6:30 AM unscheduled marker (Mon only) */}
+            {dayIdx === 0 && (
+              <div
+                className="absolute left-0 right-0 border-t border-dashed border-gray-200"
+                style={{ top: (UNSCHEDULED_MIN - CALENDAR_START_MIN) * PX_PER_MIN }}
+              />
+            )}
+
+            {/* Course blocks */}
+            {coursesByDay[dayIdx].map(({ course, topPx, heightPx, unscheduled }) => (
+              <CalendarCourseBlock
+                key={course.code}
+                course={course}
+                semesterId={semester.id}
+                topPx={topPx}
+                heightPx={heightPx}
+                unscheduled={unscheduled}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -523,6 +894,7 @@ export function CoursePlanner({
     addCourse,
     addSemester,
     removeSemester,
+    clearAllCourses,
     isPrereqSatisfied,
     isDuplicate,
     pendingChanges,
@@ -534,6 +906,16 @@ export function CoursePlanner({
   const [saving, setSaving]               = useState(false);
   const [search, setSearch]               = useState("");
   const [chatOpen, setChatOpen]           = useState(false);
+  const [viewMode, setViewMode]           = useState<"calendar" | "grid">("calendar");
+
+  // Default to the first in-progress semester, first non-empty, or Year 1 Fall.
+  const [selectedSemesterId, setSelectedSemesterId] = useState<string>(() => {
+    const sems = usePlannerStore.getState().semesters;
+    const ip = sems.find((s) => s.courses.some((c) => c.status === "in-progress"));
+    if (ip) return ip.id;
+    const nonempty = sems.find((s) => s.courses.length > 0);
+    return nonempty?.id ?? sems[0]?.id ?? "";
+  });
 
   // ── Generate Schedule modal state ─────────────────────────────────────────
   const isUndeclared = !declaredMajor || declaredMajor === "Undecided";
@@ -597,6 +979,10 @@ export function CoursePlanner({
     if (!byYear.has(s.year)) byYear.set(s.year, []);
     byYear.get(s.year)!.push(s);
   }
+
+  // Currently selected semester for calendar view
+  const selectedSemester =
+    semesters.find((s) => s.id === selectedSemesterId) ?? semesters[0];
 
   // ── Drag handlers ────────────────────────────────────────────────────────
 
@@ -664,6 +1050,9 @@ export function CoursePlanner({
     setGenerating(true);
     setGenerateResult(null);
 
+    // Clear any existing courses so the generated schedule starts fresh
+    clearAllCourses();
+
     const isComplete = genMode === "complete";
 
     // Collect selected programs
@@ -676,10 +1065,12 @@ export function CoursePlanner({
       ...(isComplete && genIncludeColl ? [COLL_CURRICULUM] : []),
     ].filter(Boolean);
 
-    // Exclude already-placed courses from the pool
-    const targetSemesters = semesters.slice(0, genSemesters);
-    const placedNow = new Set(semesters.flatMap((s) => s.courses.map((c) => c.code)));
-    const unplacedCourses = availableCourses.filter((c) => !placedNow.has(c.code));
+    // Read fresh store state — clearAllCourses() updates the store synchronously
+    // but the React closure still holds the pre-clear semesters snapshot.
+    const freshSemesters = usePlannerStore.getState().semesters;
+    const targetSemesters = freshSemesters.slice(0, genSemesters);
+    // Everything was just cleared, so the full catalog is available for planning.
+    const unplacedCourses = availableCourses;
 
     const { majorRequirements, electivePool, electiveCreditsNeeded, syntheticFallback } =
       buildRequirementsFromPrograms(selectedPrograms, unplacedCourses);
@@ -690,10 +1081,16 @@ export function CoursePlanner({
       ...majorRequirements.map((r) => r.code),
       ...electivePool.map((r) => r.code),
     ]);
+    const majorDepts = getMajorDepartments(selectedPrograms);
     const fillPool: GeneratorInput["fillPool"] = isComplete
-      ? unplacedCourses
-          .filter((c) => !scheduledCodes.has(c.code) && extractCourseLevel(c.code) < 500)
-          .map((c) => ({
+      ? shuffle(
+          unplacedCourses.filter(
+            (c) =>
+              !scheduledCodes.has(c.code) &&
+              extractCourseLevel(c.code) < 500 &&
+              (!c.majorRestriction || majorDepts.has(c.majorRestriction))
+          )
+        ).map((c) => ({
             code:              c.code,
             credits:           c.credits,
             prerequisiteCodes: c.prerequisiteCodes,
@@ -838,6 +1235,12 @@ export function CoursePlanner({
               >
                 Course Catalog
               </Link>
+              <Link
+                href="/student-info"
+                className="rounded-lg px-4 py-2 text-sm font-medium text-gray-500 hover:bg-gray-50 hover:text-gray-700"
+              >
+                Student Info
+              </Link>
             </nav>
           </div>
 
@@ -927,12 +1330,139 @@ export function CoursePlanner({
         {/* ── Main layout ────────────────────────────────────────────────── */}
         <div className="flex flex-1 overflow-hidden">
 
-          {/* ── Left: Course pool ────────────────────────────────────────── */}
+          {/* ── Left: Semester list ───────────────────────────────────────── */}
+          <aside className="flex w-44 shrink-0 flex-col border-r border-gray-200 bg-white">
+            <div className="shrink-0 border-b border-gray-100 px-3 py-2.5">
+              <p className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">
+                Semesters
+              </p>
+            </div>
+
+            {/* Semester buttons */}
+            <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+              {semesters.map((sem) => {
+                const semCredits = sem.courses.reduce((s, c) => s + c.credits, 0);
+                const isSelected = sem.id === selectedSemesterId;
+                const isOverloaded = semCredits > 18;
+                const hasInProgress = sem.courses.some((c) => c.status === "in-progress");
+                return (
+                  <button
+                    key={sem.id}
+                    onClick={() => {
+                      setSelectedSemesterId(sem.id);
+                      if (viewMode === "grid") setViewMode("calendar");
+                    }}
+                    className={[
+                      "w-full rounded-lg px-3 py-2 text-left transition-colors",
+                      isSelected
+                        ? "bg-green-50 ring-1 ring-green-200"
+                        : "hover:bg-gray-50",
+                    ].join(" ")}
+                  >
+                    <p className={`text-xs font-semibold leading-tight ${isSelected ? "text-green-800" : "text-gray-700"}`}>
+                      {sem.label}
+                    </p>
+                    <div className="mt-0.5 flex items-center gap-1.5">
+                      <span
+                        className={`text-[10px] tabular-nums ${
+                          isOverloaded
+                            ? "text-red-500 font-semibold"
+                            : isSelected
+                            ? "text-green-600"
+                            : "text-gray-400"
+                        }`}
+                      >
+                        {semCredits} cr
+                      </span>
+                      {hasInProgress && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-yellow-400" title="In progress" />
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Bottom controls */}
+            <div className="shrink-0 border-t border-gray-100 p-2 space-y-1.5">
+              <button
+                onClick={addSemester}
+                className="w-full rounded-lg border border-gray-200 py-1.5 text-[11px]
+                           font-medium text-gray-500 hover:bg-gray-50 transition-colors"
+              >
+                + Add Semester
+              </button>
+              <button
+                onClick={() => setViewMode((v) => v === "grid" ? "calendar" : "grid")}
+                className="w-full rounded-lg border border-gray-200 py-1.5 text-[11px]
+                           font-medium text-gray-500 hover:bg-gray-50 transition-colors"
+              >
+                {viewMode === "grid" ? "Calendar View" : "Grid View"}
+              </button>
+            </div>
+          </aside>
+
+          {/* ── Middle: Calendar or Grid ──────────────────────────────────── */}
+          {viewMode === "calendar" ? (
+            selectedSemester ? (
+              <WeeklyCalendar semester={selectedSemester} activeCourse={activeCourse} />
+            ) : (
+              <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
+                Select a semester on the left to view its calendar.
+              </div>
+            )
+          ) : (
+            <main className={["flex-1 overflow-y-auto px-6 py-5", chatOpen ? "min-w-0" : ""].join(" ")}>
+              <div className="mb-4">
+                <p className="text-xs text-gray-400">
+                  Drag courses from the right panel into a semester. Click a semester on the left for Calendar View.
+                </p>
+              </div>
+              <div className="flex flex-col gap-8">
+                {Array.from(byYear.entries())
+                  .sort(([a], [b]) => a - b)
+                  .map(([year, yearSemesters]) => (
+                    <section key={year}>
+                      <div className="mb-3 flex items-center gap-3">
+                        <h2 className="text-sm font-bold text-gray-700">
+                          {year <= 4 ? `Year ${year}` : `Additional — Year ${year}`}
+                        </h2>
+                        <div className="flex-1 border-t border-gray-200" />
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        {yearSemesters.map((semester) => (
+                          <SemesterColumn
+                            key={semester.id}
+                            semester={semester}
+                            activeCourse={activeCourse}
+                            onRemoveSemester={removeSemester}
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+              </div>
+            </main>
+          )}
+
+          {/* ── Chat sidebar (when open) ──────────────────────────────────── */}
+          {chatOpen && (
+            <aside className="flex w-80 shrink-0 flex-col border-l border-gray-200 bg-white">
+              <ChatPanel
+                courseCatalog={availableCourses.map((c) => ({
+                  code: c.code,
+                  title: c.title,
+                  credits: c.credits,
+                }))}
+              />
+            </aside>
+          )}
+
+          {/* ── Right: Course catalog ─────────────────────────────────────── */}
           <aside
             data-testid="course-pool"
-            className="flex w-72 shrink-0 flex-col border-r border-gray-200 bg-white"
+            className="flex w-72 shrink-0 flex-col border-l border-gray-200 bg-white"
           >
-            {/* Pool header */}
             <div className="shrink-0 border-b border-gray-100 px-4 py-3">
               <h2 className="mb-2 text-sm font-semibold text-gray-700">Course Catalog</h2>
               <input
@@ -944,9 +1474,13 @@ export function CoursePlanner({
                            text-gray-700 placeholder-gray-300 focus:border-green-400
                            focus:outline-none focus:ring-2 focus:ring-green-100"
               />
+              {viewMode === "calendar" && selectedSemester && (
+                <p className="mt-1.5 text-[10px] text-gray-400">
+                  Drop onto calendar → adds to{" "}
+                  <span className="font-medium text-green-700">{selectedSemester.label}</span>
+                </p>
+              )}
             </div>
-
-            {/* Scrollable course list */}
             <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-3">
               {filteredCourses.length === 0 && (
                 <p className="mt-8 text-center text-xs text-gray-300">No courses match your search.</p>
@@ -960,61 +1494,6 @@ export function CoursePlanner({
               ))}
             </div>
           </aside>
-
-          {/* ── Right: Semester grid ─────────────────────────────────────── */}
-          <main className={["flex-1 overflow-y-auto px-6 py-5", chatOpen ? "min-w-0" : ""].join(" ")}>
-            <div className="mb-4 flex items-center justify-between">
-              <p className="text-xs text-gray-400">
-                Drag courses from the left panel into a semester below.
-              </p>
-              <button
-                onClick={addSemester}
-                className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs
-                           font-medium text-gray-600 shadow-sm hover:bg-gray-50 transition-colors"
-              >
-                + Add Semester
-              </button>
-            </div>
-
-            {/* Year groups */}
-            <div className="flex flex-col gap-8">
-              {Array.from(byYear.entries())
-                .sort(([a], [b]) => a - b)
-                .map(([year, yearSemesters]) => (
-                  <section key={year}>
-                    <div className="mb-3 flex items-center gap-3">
-                      <h2 className="text-sm font-bold text-gray-700">
-                        {year <= 4 ? `Year ${year}` : `Additional — Year ${year}`}
-                      </h2>
-                      <div className="flex-1 border-t border-gray-200" />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      {yearSemesters.map((semester) => (
-                        <SemesterColumn
-                          key={semester.id}
-                          semester={semester}
-                          activeCourse={activeCourse}
-                          onRemoveSemester={removeSemester}
-                        />
-                      ))}
-                    </div>
-                  </section>
-                ))}
-            </div>
-          </main>
-          {/* ── Chat sidebar ─────────────────────────────────────────────── */}
-          {chatOpen && (
-            <aside className="flex w-80 shrink-0 flex-col border-l border-gray-200 bg-white">
-              <ChatPanel
-                courseCatalog={availableCourses.map((c) => ({
-                  code: c.code,
-                  title: c.title,
-                  credits: c.credits,
-                }))}
-              />
-            </aside>
-          )}
         </div>
 
         {/* ── Requirement tracker (expandable, below grid) ────────────────── */}

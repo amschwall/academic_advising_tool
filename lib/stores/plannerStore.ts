@@ -5,6 +5,8 @@ import { create } from "zustand";
 // Types
 // ---------------------------------------------------------------------------
 
+export type CourseStatus = "planned" | "in-progress" | "completed";
+
 export interface PlannedCourse {
   code: string;
   title: string;
@@ -20,6 +22,8 @@ export interface PlannedCourse {
   artsProf?: boolean;
   // Used for major/minor credit requirement matching
   department?: string;
+  /** Tracks whether the course has been completed, is in progress, or just planned. */
+  status?: CourseStatus;
 }
 
 export interface Semester {
@@ -45,8 +49,10 @@ interface PlannerStore {
   // Mutators
   addCourse: (semesterId: string, course: PlannedCourse) => void;
   removeCourse: (semesterId: string, courseCode: string) => void;
+  setCourseStatus: (semesterId: string, courseCode: string, status: CourseStatus) => void;
   addSemester: () => void;
   removeSemester: (semesterId: string) => void;
+  clearAllCourses: () => void;
   clearPendingChanges: () => void;
   reset: () => void;
 
@@ -149,6 +155,27 @@ export const usePlannerStore = create<PlannerStore>((set, get) => ({
   removeSemester: (semesterId) => {
     set((state) => ({
       semesters: state.semesters.filter((s) => s.id !== semesterId),
+    }));
+  },
+
+  // ── setCourseStatus ───────────────────────────────────────────────────────
+  setCourseStatus: (semesterId, courseCode, status) => {
+    set((state) => ({
+      semesters: state.semesters.map((s) =>
+        s.id !== semesterId ? s : {
+          ...s,
+          courses: s.courses.map((c) =>
+            c.code === courseCode ? { ...c, status } : c
+          ),
+        }
+      ),
+    }));
+  },
+
+  clearAllCourses: () => {
+    set((state) => ({
+      semesters: state.semesters.map((s) => ({ ...s, courses: [] })),
+      pendingChanges: [],
     }));
   },
 

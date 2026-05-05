@@ -73,6 +73,20 @@ function pickSection(
 }
 
 // ---------------------------------------------------------------------------
+// Course level helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the numeric level from a course code, e.g. "CSCI303" → 300.
+ * Synthetic placeholders (no digits) return 0.
+ */
+function extractLevel(code: string): number {
+  const m = code.match(/(\d{3})/);
+  return m ? Math.floor(parseInt(m[1], 10) / 100) * 100 : 0;
+}
+
+
+// ---------------------------------------------------------------------------
 // Semester ordering
 // ---------------------------------------------------------------------------
 
@@ -172,6 +186,9 @@ function topologicalSort(
 
   const result: string[] = [];
   while (queue.length > 0) {
+    // Among all ready nodes, process the lowest-level course first so the
+    // sort output naturally orders 100-level before 200, 200 before 300, etc.
+    queue.sort((a, b) => extractLevel(a) - extractLevel(b));
     const node = queue.shift()!;
     result.push(node);
     for (const dep of dependents.get(node) ?? []) {
@@ -344,13 +361,46 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     course: GeneratorCourse,
     isEarlyColl: boolean
   ): PlannedSemester | null {
-    const eligible = plannedSemesters.filter((sem, idx) => {
+    const courseLevel = extractLevel(course.code);
+
+    // Level-ordering constraint: find the latest semester in which any
+    // already-placed required course of a lower level sits. This course must
+    // go in a strictly later semester — you finish lower-level work first,
+    // regardless of which calendar year that falls in.
+    let mustBeAfter: PlannedSemester | null = null;
+    if (courseLevel > 0) {
+      for (const [key, placed] of semCourseList) {
+        const hasLower = placed.some((c) => {
+          const l = extractLevel(c.code);
+          return l > 0 && l < courseLevel;
+        });
+        if (!hasLower) continue;
+        const dashIdx = key.indexOf("-");
+        const sem: PlannedSemester = {
+          year:   parseInt(key.slice(0, dashIdx), 10),
+          season: key.slice(dashIdx + 1) as Season,
+        };
+        if (mustBeAfter === null || semIsBefore(mustBeAfter, sem)) mustBeAfter = sem;
+      }
+    }
+
+    function baseFilter(sem: PlannedSemester, idx: number): boolean {
       if (!course.seasons.includes(sem.season)) return false;
       const key = semKey(sem.year, sem.season);
       if ((semCredits.get(key) ?? 0) + course.credits > MAX_SEM_CREDITS) return false;
       if (isEarlyColl && idx >= 4) return false;
       return prereqsSatisfiedBefore(course.code, sem);
+    }
+
+    // Apply level constraint: only consider semesters after mustBeAfter.
+    // If that leaves nothing (e.g. very short plan), fall back to base filter.
+    let eligible = plannedSemesters.filter((sem, idx) => {
+      if (mustBeAfter !== null && !semIsBefore(mustBeAfter, sem)) return false;
+      return baseFilter(sem, idx);
     });
+    if (eligible.length === 0) {
+      eligible = plannedSemesters.filter(baseFilter);
+    }
 
     if (eligible.length === 0) return null;
 
@@ -401,14 +451,35 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     placedCodes.add(course.code);
   }
 
-  // ── 6. Place required courses (topological order, earliest-under-target) ─
+  // ── 6. Place required courses (topological + level order) ────────────────
 
   for (const code of sortedCodes) {
     const course = courseMap.get(code)!;
     const isEarlyColl = earlyCollCodes.has(code);
     const sem = findRequiredSemester(course, isEarlyColl);
     if (sem) placeCourse(course, sem);
-    // If no semester found (shouldn't happen after pre-checks), silently skip.
+  }
+
+  // ── 6b. Guarantee every required course is placed ─────────────────────────
+  // Level-ordering or prerequisite constraints may have left some courses
+  // unplaced. Retry them with only the capacity constraint — level ordering is
+  // dropped so every required course is guaranteed a slot, even if the ideal
+  // ordering can't be achieved with the available semesters.
+  for (const code of sortedCodes) {
+    if (placedCodes.has(code)) continue;
+    const course = courseMap.get(code)!;
+    const eligible = plannedSemesters.filter((sem) => {
+      if (!course.seasons.includes(sem.season)) return false;
+      const key = semKey(sem.year, sem.season);
+      return (semCredits.get(key) ?? 0) + course.credits <= MAX_SEM_CREDITS;
+    });
+    if (eligible.length === 0) continue;
+    const sem = eligible.reduce((best, s) => {
+      const bc = semCredits.get(semKey(best.year, best.season)) ?? 0;
+      const sc = semCredits.get(semKey(s.year, s.season)) ?? 0;
+      return sc < bc ? s : best;
+    });
+    placeCourse(course, sem);
   }
 
   // ── 7. Fill with major-specific electives up to electiveCreditsNeeded ─────

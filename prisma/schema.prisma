@@ -53,10 +53,11 @@ model Course {
   description   String?
   department    String
   // General-education designations (free-text tag for COLL, boolean flags for others)
-  collAttribute String?             // e.g. "COLL 100", "COLL 200", "COLL 300", "COLL 400"; null if not a COLL course
-  alv           Boolean             @default(false) // Arts, Literature & Values
-  nqr           Boolean             @default(false) // Natural, Quantitative & Reasoning
-  csi           Boolean             @default(false) // Culture, Society & Identity
+  collAttribute    String?             // e.g. "COLL 100", "COLL 200", "COLL 300", "COLL 400"; null if not a COLL course
+  alv              Boolean             @default(false) // Arts, Literature & Values
+  nqr              Boolean             @default(false) // Natural, Quantitative & Reasoning
+  csi              Boolean             @default(false) // Culture, Society & Identity
+  majorRestriction String?             // department code (e.g. "CSCI") if enrollment is restricted to that major; null = open
   prerequisites Prerequisite[]      @relation("CoursePrerequisites")
   requiredBy    Prerequisite[]      @relation("PrerequisiteFor")
   scheduleItems ScheduleItem[]
