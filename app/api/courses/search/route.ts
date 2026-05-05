@@ -3,15 +3,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { withRole } from "@/lib/middleware/withRole";
 import { prisma } from "@/lib/db";
-import { InMemoryCache } from "@/lib/cache/memory";
+import { Prisma } from "@prisma/client";
+import { searchCache } from "@/lib/cache/searchCache";
 import { CacheKeys, SEARCH_TTL_SECONDS } from "@/lib/cache/keys";
-
-/**
- * Module-level cache for search results.
- * Exported so tests can call searchCache.clear() between cases.
- * Course catalog data changes rarely, so a 5-minute TTL is appropriate.
- */
-export const searchCache = new InMemoryCache();
 
 const DEFAULT_PAGE  = 1;
 const DEFAULT_LIMIT = 20;
@@ -37,6 +31,9 @@ async function handler(req: NextRequest): Promise<NextResponse> {
   const collAttribute = searchParams.get("collAttribute");
   const creditsParam  = searchParams.get("credits");
   const days          = searchParams.get("days");
+  const alvParam      = searchParams.get("alv");
+  const csiParam      = searchParams.get("csi");
+  const nqrParam      = searchParams.get("nqr");
 
   const page  = Math.max(1, parseInt(searchParams.get("page")  ?? String(DEFAULT_PAGE),  10) || DEFAULT_PAGE);
   const limit = Math.max(1, parseInt(searchParams.get("limit") ?? String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT);
@@ -48,6 +45,9 @@ async function handler(req: NextRequest): Promise<NextResponse> {
   if (code)          where["code"]          = { contains: code,          mode: "insensitive" };
   if (title)         where["title"]         = { contains: title,         mode: "insensitive" };
   if (collAttribute) where["collAttribute"] = { equals: collAttribute };
+  if (alvParam === "true") where["alv"] = true;
+  if (csiParam === "true") where["csi"] = true;
+  if (nqrParam === "true") where["nqr"] = true;
   if (creditsParam) {
     const credits = parseInt(creditsParam, 10);
     if (!isNaN(credits)) where["credits"] = { equals: credits };
@@ -59,7 +59,14 @@ async function handler(req: NextRequest): Promise<NextResponse> {
     ? { where: { days: { contains: days } } }
     : true;
 
-  let rawCourses: Awaited<ReturnType<typeof prisma.course.findMany>>;
+  type RawCourse = Prisma.CourseGetPayload<{
+    include: {
+      prerequisites: { include: { prerequisite: { select: { code: true } } } };
+      sections: true;
+    };
+  }>;
+
+  let rawCourses: RawCourse[];
   let total: number;
 
   try {
@@ -90,15 +97,17 @@ async function handler(req: NextRequest): Promise<NextResponse> {
   //   prerequisiteCodes: string[]           (flattened from the join table)
   //   sections[].professor / .location      (Section stores instructor, not professor)
   const courses = rawCourses.map((c) => ({
-    code:          c.code,
-    title:         c.title,
-    department:    c.department,
-    credits:       c.credits,
-    collAttribute: c.collAttribute,
-    alv:           c.alv,
-    csi:           c.csi,
-    nqr:           c.nqr,
-    description:   c.description,
+    code:             c.code,
+    title:            c.title,
+    department:       c.department,
+    credits:          c.credits,
+    collAttribute:    c.collAttribute,
+    alv:              c.alv,
+    csi:              c.csi,
+    nqr:              c.nqr,
+    description:      c.description,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    majorRestriction: (c as any).majorRestriction ?? null,
     prerequisiteCodes: c.prerequisites.map((p) => p.prerequisite.code),
     sections: c.sections.map((s) => ({
       professor: s.instructor ?? "TBA",
