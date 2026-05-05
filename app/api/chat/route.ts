@@ -1,6 +1,7 @@
 // file: app/api/chat/route.ts
 import { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { recordUsage } from "@/lib/cost/tracker";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -134,6 +135,10 @@ export async function POST(req: NextRequest): Promise<Response> {
             controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
           }
         }
+
+        // Capture token usage and record cost
+        const final = await sdkStream.finalMessage();
+        recordUsage(final.usage.input_tokens, final.usage.output_tokens);
 
         // Signal done
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
