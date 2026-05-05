@@ -68,7 +68,8 @@ jest.mock("@anthropic-ai/sdk", () => ({
 
 import { NextRequest }           from "next/server";
 import { generateSchedule }      from "@/lib/generator/generator";
-import { GET as searchHandler, searchCache } from "@/app/api/courses/search/route";
+import { GET as searchHandler }   from "@/app/api/courses/search/route";
+import { searchCache }            from "@/lib/cache/searchCache";
 import { POST as chatHandler }   from "@/app/api/chat/route";
 import { InMemoryCache }         from "@/lib/cache/memory";
 import {
