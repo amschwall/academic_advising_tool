@@ -274,8 +274,12 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
 
   // ── 3. Cycle detection ────────────────────────────────────────────────────
 
+  // prereqMap covers ALL courses that may be placed (required + elective + fill)
+  // so that prerequisite checks are enforced for every course, not just required ones.
   const prereqMap = new Map<string, string[]>();
-  for (const c of dedupedRequired) prereqMap.set(c.code, c.prerequisiteCodes);
+  for (const c of dedupedRequired)             prereqMap.set(c.code, c.prerequisiteCodes);
+  for (const c of electivePool)                prereqMap.set(c.code, c.prerequisiteCodes);
+  for (const c of (input.fillPool ?? []))      prereqMap.set(c.code, c.prerequisiteCodes);
 
   if (detectCycle(dedupedRequired.map((c) => c.code), prereqMap)) {
     return {
@@ -422,14 +426,16 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
   }
 
   /**
-   * For electives: pick the eligible semester with the lowest current credit count
-   * (fills gaps left by required courses). Falls back to any eligible if all are at target.
+   * For electives/fill: pick the earliest eligible semester with the lowest credit count.
+   * Enforces prerequisite ordering — the course may only be placed in a semester where
+   * every one of its prerequisites is already placed in a strictly earlier semester.
    */
   function findElectiveSemester(course: GeneratorCourse): PlannedSemester | null {
     const eligible = plannedSemesters.filter((sem) => {
       if (!course.seasons.includes(sem.season)) return false;
       const key = semKey(sem.year, sem.season);
-      return (semCredits.get(key) ?? 0) + course.credits <= MAX_SEM_CREDITS;
+      if ((semCredits.get(key) ?? 0) + course.credits > MAX_SEM_CREDITS) return false;
+      return prereqsSatisfiedBefore(course.code, sem);
     });
     if (eligible.length === 0) return null;
     return eligible.reduce((best, s) => {
@@ -460,20 +466,24 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     if (sem) placeCourse(course, sem);
   }
 
-  // ── 6b. Guarantee every required course is placed ─────────────────────────
-  // Level-ordering or prerequisite constraints may have left some courses
-  // unplaced. Retry them with only the capacity constraint — level ordering is
-  // dropped so every required course is guaranteed a slot, even if the ideal
-  // ordering can't be achieved with the available semesters.
+  // ── 6b. Retry unplaced required courses without level-ordering constraint ────
+  // Level-ordering constraints may have blocked placement in Step 6. Retry using
+  // only the prereq + season + credit constraints (no level ordering). We never
+  // drop the prereq constraint: it is better to omit a course than to place it
+  // before its prerequisites.
   for (const code of sortedCodes) {
     if (placedCodes.has(code)) continue;
     const course = courseMap.get(code)!;
+
     const eligible = plannedSemesters.filter((sem) => {
       if (!course.seasons.includes(sem.season)) return false;
       const key = semKey(sem.year, sem.season);
-      return (semCredits.get(key) ?? 0) + course.credits <= MAX_SEM_CREDITS;
+      if ((semCredits.get(key) ?? 0) + course.credits > MAX_SEM_CREDITS) return false;
+      return prereqsSatisfiedBefore(course.code, sem);
     });
-    if (eligible.length === 0) continue;
+
+    if (eligible.length === 0) continue; // No valid slot — skip rather than violate prereqs.
+
     const sem = eligible.reduce((best, s) => {
       const bc = semCredits.get(semKey(best.year, best.season)) ?? 0;
       const sc = semCredits.get(semKey(s.year, s.season)) ?? 0;
@@ -508,12 +518,14 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
   for (const course of fillPool) {
     if (placedCodes.has(course.code)) continue;
 
-    // Find the semester with the lowest load that is still under TARGET_CREDITS
+    // Find the semester with the lowest load that is still under TARGET_CREDITS.
+    // Prerequisites must be satisfied — a fill course cannot be placed before its prereqs.
     const eligible = plannedSemesters.filter((sem) => {
       if (!course.seasons.includes(sem.season)) return false;
       const key = semKey(sem.year, sem.season);
       const cur = semCredits.get(key) ?? 0;
-      return cur < TARGET_CREDITS && cur + course.credits <= MAX_SEM_CREDITS;
+      if (cur >= TARGET_CREDITS || cur + course.credits > MAX_SEM_CREDITS) return false;
+      return prereqsSatisfiedBefore(course.code, sem);
     });
     if (eligible.length === 0) continue;
 

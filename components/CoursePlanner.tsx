@@ -1,7 +1,7 @@
 // file: components/CoursePlanner.tsx
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import {
   DndContext,
@@ -16,6 +16,7 @@ import {
 import { usePlannerStore, type PlannedCourse, type Semester } from "@/lib/stores/plannerStore";
 import { RequirementTracker } from "@/components/RequirementTracker";
 import { ChatPanel } from "@/components/ChatPanel";
+import { useWhatIfStore } from "@/lib/stores/whatIfStore";
 import type { GeneratorInput, GeneratedPlan, Season } from "@/lib/generator/types";
 import {
   MAJORS,
@@ -46,6 +47,14 @@ interface Course {
 interface Notification {
   type: "error" | "warning" | "success";
   message: string;
+}
+
+/** Optional overrides for handleGenerate — used by the what-if "Generate Schedule" path. */
+interface GenerateOverrides {
+  major?: string;
+  secondMajor?: string;
+  minor?: string;
+  concentration?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +188,19 @@ function buildRequirementsFromPrograms(
 } {
   const courseMap         = new Map(availableCourses.map((c) => [c.code, c]));
   const majorDepts        = getMajorDepartments(programs);
+  // All departments that correspond to a known program — courses from any other
+  // department (e.g. LAW) are treated as restricted to their own school.
+  const allKnownDepts     = getMajorDepartments([...MAJORS, ...MINORS, ...CONCENTRATIONS]);
   // Shuffle once so all catalog-fallback and gen-ed loops pick randomly,
   // and pre-filter to exclude courses restricted to a major the student isn't in.
   const shuffledCourses   = shuffle(
-    availableCourses.filter(
-      (c) => !c.majorRestriction || majorDepts.has(c.majorRestriction)
-    )
+    availableCourses.filter((c) => {
+      if (c.majorRestriction) return majorDepts.has(c.majorRestriction);
+      // No explicit restriction: allow only courses from known program departments
+      // or courses with gen-ed / COLL flags (open to all students).
+      return allKnownDepts.has(c.department ?? "") ||
+             c.alv || c.csi || c.nqr || !!c.collAttribute;
+    })
   );
   const seenRequired      = new Set<string>();
   const syntheticFallback = new Map<string, Course>();
@@ -257,13 +273,21 @@ function buildRequirementsFromPrograms(
           }
 
           if (req.electiveCourses && req.electiveCourses.length > 0) {
-            // Approved elective list defined — shuffle and pick randomly.
+            // Approved elective list — shuffle and pick, skipping courses whose
+            // prerequisites are not already in the required set. This prevents the
+            // generator from dragging in unexpected prerequisite chains just to
+            // satisfy an elective slot.
             const shuffled = [...req.electiveCourses].sort(() => Math.random() - 0.5);
             for (const elec of shuffled) {
               if (covered >= req.credits) break;
               if (seenRequired.has(elec.code)) continue;
-              // Prefer DB version (has section info); fall back to static definition.
+              // Prefer DB version (has section info + real prereqs).
               const dbCourse = courseMap.get(elec.code);
+              const prereqs = dbCourse?.prerequisiteCodes ?? [];
+              // Skip this elective if any of its prerequisites are not already
+              // in the required set — we don't want to force-add prereq chains
+              // just to satisfy an elective credit requirement.
+              if (prereqs.some((p) => !seenRequired.has(p))) continue;
               addRequired(
                 dbCourse
                   ? toGenCourse(dbCourse)
@@ -281,12 +305,14 @@ function buildRequirementsFromPrograms(
           } else {
             // No approved list — fall back to catalog filtering (shuffled for variety).
             // Cap at level 400; graduate courses (500+) must be placed manually.
+            // Skip courses whose prerequisites are not already in the required set.
             for (const course of shuffledCourses) {
               if (covered >= req.credits) break;
               if (seenRequired.has(course.code)) continue;
               if (extractCourseLevel(course.code) >= 500) continue;
               if (req.departments && !req.departments.includes(course.department ?? "")) continue;
               if (req.minLevel && extractCourseLevel(course.code) < req.minLevel) continue;
+              if (course.prerequisiteCodes.some((p) => !seenRequired.has(p))) continue;
               addRequired(toGenCourse(course));
               covered += course.credits;
             }
@@ -330,6 +356,33 @@ function buildRequirementsFromPrograms(
         // Synthesize any missing gen-ed slots
         for (let i = addedCount; i < req.count; i++) {
           addSynthetic(req.credits, req.description, req.attribute);
+        }
+      }
+    }
+  }
+
+  // ── Transitive prerequisite closure ────────────────────────────────────────
+  // After all program requirements are collected, scan every required course's
+  // prerequisiteCodes and pull in any that are not yet in the plan.  Repeat
+  // until stable so multi-level chains (e.g. ART420→ART325, ART412→ART324→ART211)
+  // are fully resolved.  Auto-added courses are treated as required (guaranteed
+  // placement) so the generator never has to place a course whose prereq is
+  // absent from the plan.
+  //
+  // Skip synthetic placeholders — they represent COLL / gen-ed slots that have
+  // no real catalog entry and therefore no real prerequisites.
+  {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const req of [...majorRequirements]) {
+        if (syntheticFallback.has(req.code)) continue; // synthetic — no real prereqs
+        for (const prereqCode of req.prerequisiteCodes) {
+          if (seenRequired.has(prereqCode)) continue;  // already in plan
+          const prereqCourse = courseMap.get(prereqCode);
+          if (!prereqCourse) continue;                 // not in catalog — skip
+          addRequired(toGenCourse(prereqCourse));
+          changed = true;
         }
       }
     }
@@ -569,27 +622,40 @@ function CalendarCourseBlock({
   topPx,
   heightPx,
   unscheduled,
+  colIndex = 0,
+  colTotal = 1,
 }: {
   course: PlannedCourse;
   semesterId: string;
   topPx: number;
   heightPx: number;
   unscheduled: boolean;
+  colIndex?: number;
+  colTotal?: number;
 }) {
   const removeCourse = usePlannerStore((s) => s.removeCourse);
   const [open, setOpen] = useState(false);
   const status = course.status ?? "planned";
   const colorCls = BLOCK_CLS[status] ?? BLOCK_DEFAULT;
 
+  const leftPct  = (colIndex / colTotal) * 100;
+  const widthPct = (1 / colTotal) * 100;
+
   return (
     <div
       className={[
-        "absolute left-0.5 right-0.5 cursor-pointer select-none overflow-visible",
+        "absolute cursor-pointer select-none overflow-visible",
         "rounded border-l-2 px-1.5 py-0.5 shadow-sm hover:shadow-md transition-shadow",
         unscheduled ? "opacity-60 border-dashed" : "",
         colorCls,
       ].join(" ")}
-      style={{ top: topPx, height: Math.max(heightPx, 18), zIndex: open ? 30 : 10 }}
+      style={{
+        top: topPx,
+        height: Math.max(heightPx, 18),
+        left: `calc(${leftPct}% + 2px)`,
+        width: `calc(${widthPct}% - 4px)`,
+        zIndex: open ? 30 : 10,
+      }}
       onClick={() => setOpen((v) => !v)}
       title={`${course.code}: ${course.title}${unscheduled ? " (time TBD)" : ""}`}
     >
@@ -653,7 +719,7 @@ function WeeklyCalendar({
   const totalHeight = CALENDAR_RANGE * PX_PER_MIN; // 960 px
 
   // Build per-day course blocks
-  type BlockInfo = { course: PlannedCourse; topPx: number; heightPx: number; unscheduled: boolean };
+  type BlockInfo = { course: PlannedCourse; topPx: number; heightPx: number; unscheduled: boolean; colIndex: number; colTotal: number };
   const coursesByDay: BlockInfo[][] = CALENDAR_DAYS.map(() => []);
 
   for (const course of semester.courses) {
@@ -671,9 +737,18 @@ function WeeklyCalendar({
 
     for (const d of targetDays) {
       if (d >= 0 && d <= 4) {
-        coursesByDay[d].push({ course, topPx, heightPx, unscheduled });
+        coursesByDay[d].push({ course, topPx, heightPx, unscheduled, colIndex: 0, colTotal: 1 });
       }
     }
+  }
+
+  // Assign side-by-side column slots to all unscheduled blocks in Monday column
+  const mondayUnscheduled = coursesByDay[0].filter((b) => b.unscheduled);
+  if (mondayUnscheduled.length > 1) {
+    mondayUnscheduled.forEach((b, i) => {
+      b.colIndex = i;
+      b.colTotal = mondayUnscheduled.length;
+    });
   }
 
   const hours = Array.from({ length: CALENDAR_RANGE / 60 }, (_, i) => CALENDAR_START_MIN + i * 60);
@@ -765,7 +840,7 @@ function WeeklyCalendar({
             )}
 
             {/* Course blocks */}
-            {coursesByDay[dayIdx].map(({ course, topPx, heightPx, unscheduled }) => (
+            {coursesByDay[dayIdx].map(({ course, topPx, heightPx, unscheduled, colIndex, colTotal }) => (
               <CalendarCourseBlock
                 key={course.code}
                 course={course}
@@ -773,6 +848,8 @@ function WeeklyCalendar({
                 topPx={topPx}
                 heightPx={heightPx}
                 unscheduled={unscheduled}
+                colIndex={colIndex}
+                colTotal={colTotal}
               />
             ))}
           </div>
@@ -926,7 +1003,7 @@ export function CoursePlanner({
   const [genNoFriday, setGenNoFriday]         = useState(false);
   const [generating, setGenerating]           = useState(false);
   const [generateResult, setGenerateResult]   = useState<
-    { type: "success"; message: string } | { type: "error"; message: string } | null
+    { type: "success"; message: string } | { type: "warning"; message: string } | { type: "error"; message: string } | null
   >(null);
   // Program selections
   const [genMajor, setGenMajor]               = useState(isUndeclared ? "" : (declaredMajor ?? ""));
@@ -948,6 +1025,31 @@ export function CoursePlanner({
   });
 
   const sensors = useSensors(useSensor(PointerSensor), useSensor(KeyboardSensor));
+
+  // ── What-If store ─────────────────────────────────────────────────────────
+  const whatIf = useWhatIfStore();
+
+  // Ref so the generate effect always calls the latest version of handleGenerate
+  // without needing it in its dependency array (avoids infinite loops).
+  const handleGenerateRef = useRef<(overrides?: GenerateOverrides) => Promise<void>>();
+
+  // Fire schedule generation exactly once each time the user clicks
+  // "Generate Schedule" in the what-if modal.
+  const lastGenerateTrigger = useRef(0);
+  useEffect(() => {
+    if (
+      whatIf.active &&
+      whatIf.mode === "generate" &&
+      whatIf.generateTriggerCount > lastGenerateTrigger.current
+    ) {
+      lastGenerateTrigger.current = whatIf.generateTriggerCount;
+      handleGenerateRef.current?.({
+        major:         whatIf.major         ?? undefined,
+        minor:         whatIf.minor         ?? undefined,
+        concentration: whatIf.concentration ?? undefined,
+      });
+    }
+  }, [whatIf.active, whatIf.mode, whatIf.generateTriggerCount]);
 
   // Close generate modal on Escape key
   useEffect(() => {
@@ -1021,9 +1123,17 @@ export function CoursePlanner({
     const courseCode = course.code;
 
     if (!isPrereqSatisfied(semesterId, course)) {
+      // Identify which prereqs are actually missing from earlier semesters.
+      const { semesters: allSems } = usePlannerStore.getState();
+      const semIdx = allSems.findIndex((s) => s.id === semesterId);
+      const earlierCodes = new Set<string>();
+      for (let i = 0; i < semIdx; i++) {
+        allSems[i].courses.forEach((c) => earlierCodes.add(c.code));
+      }
+      const missing = course.prerequisiteCodes.filter((p) => !earlierCodes.has(p));
       setNotification({
         type: "error",
-        message: `Prerequisite not satisfied. Place ${course.prerequisiteCodes.join(", ")} in an earlier semester first.`,
+        message: `${course.code} requires ${missing.join(", ")} — place ${missing.length === 1 ? "it" : "them"} in an earlier semester first.`,
       });
       return;
     }
@@ -1041,8 +1151,13 @@ export function CoursePlanner({
 
   // ── Generate Schedule ────────────────────────────────────────────────────
 
-  async function handleGenerate() {
-    if (!genMajor) {
+  async function handleGenerate(overrides?: GenerateOverrides) {
+    const effectiveMajor       = overrides?.major         ?? genMajor;
+    const effectiveSecondMajor = overrides?.secondMajor   ?? genSecondMajor;
+    const effectiveMinor       = overrides?.minor         ?? genMinor;
+    const effectiveConc        = overrides?.concentration ?? genConcentration;
+
+    if (!effectiveMajor) {
       setGenerateResult({ type: "error", message: "Please select a major before generating." });
       return;
     }
@@ -1057,10 +1172,10 @@ export function CoursePlanner({
 
     // Collect selected programs
     const selectedPrograms: ProgramDefinition[] = [
-      MAJORS.find((m) => m.name === genMajor)!,
-      ...(genSecondMajor ? [MAJORS.find((m) => m.name === genSecondMajor)!] : []),
-      ...(genMinor ? [MINORS.find((m) => m.name === genMinor)!] : []),
-      ...(genConcentration ? [CONCENTRATIONS.find((c) => c.name === genConcentration)!] : []),
+      MAJORS.find((m) => m.name === effectiveMajor)!,
+      ...(effectiveSecondMajor ? [MAJORS.find((m) => m.name === effectiveSecondMajor)!] : []),
+      ...(effectiveMinor ? [MINORS.find((m) => m.name === effectiveMinor)!] : []),
+      ...(effectiveConc ? [CONCENTRATIONS.find((c) => c.name === effectiveConc)!] : []),
       // COLL gen-ed only in "complete" mode
       ...(isComplete && genIncludeColl ? [COLL_CURRICULUM] : []),
     ].filter(Boolean);
@@ -1081,15 +1196,17 @@ export function CoursePlanner({
       ...majorRequirements.map((r) => r.code),
       ...electivePool.map((r) => r.code),
     ]);
-    const majorDepts = getMajorDepartments(selectedPrograms);
+    const majorDepts     = getMajorDepartments(selectedPrograms);
+    const allKnownDepts2 = getMajorDepartments([...MAJORS, ...MINORS, ...CONCENTRATIONS]);
     const fillPool: GeneratorInput["fillPool"] = isComplete
       ? shuffle(
-          unplacedCourses.filter(
-            (c) =>
-              !scheduledCodes.has(c.code) &&
-              extractCourseLevel(c.code) < 500 &&
-              (!c.majorRestriction || majorDepts.has(c.majorRestriction))
-          )
+          unplacedCourses.filter((c) => {
+            if (scheduledCodes.has(c.code)) return false;
+            if (extractCourseLevel(c.code) >= 500) return false;
+            if (c.majorRestriction) return majorDepts.has(c.majorRestriction);
+            return allKnownDepts2.has(c.department ?? "") ||
+                   c.alv || c.csi || c.nqr || !!c.collAttribute;
+          })
         ).map((c) => ({
             code:              c.code,
             credits:           c.credits,
@@ -1179,7 +1296,15 @@ export function CoursePlanner({
         }
       }
 
-      setGenerateResult({ type: "success", message: "Schedule generated successfully!" });
+      const warnings: string[] = data.warnings ?? [];
+      if (warnings.length > 0) {
+        setGenerateResult({
+          type: "warning",
+          message: `Schedule generated with ${warnings.length} prerequisite issue(s). Some courses may need to be placed manually.`,
+        });
+      } else {
+        setGenerateResult({ type: "success", message: "Schedule generated successfully!" });
+      }
       setGenerateOpen(false);
     } catch {
       setGenerateResult({ type: "error", message: "Network error. Please try again." });
@@ -1187,6 +1312,9 @@ export function CoursePlanner({
       setGenerating(false);
     }
   }
+
+  // Keep the ref in sync so the what-if effect always calls the latest closure.
+  handleGenerateRef.current = handleGenerate;
 
   // ── Save ─────────────────────────────────────────────────────────────────
 
@@ -1742,7 +1870,7 @@ export function CoursePlanner({
               </button>
               <button
                 data-testid="generate-submit"
-                onClick={handleGenerate}
+                onClick={() => handleGenerate()}
                 disabled={generating}
                 className="rounded-lg bg-green-800 px-4 py-2 text-sm font-semibold text-white
                            shadow-sm hover:bg-green-700 disabled:cursor-not-allowed
@@ -1756,6 +1884,22 @@ export function CoursePlanner({
       )}
 
       {/* ── Generate result banners (rendered outside the modal so they persist after close) */}
+      {generateResult?.type === "warning" && (
+        <div
+          role="alert"
+          className="fixed bottom-6 left-1/2 z-40 -translate-x-1/2 rounded-xl bg-amber-500
+                     px-5 py-3 text-sm font-medium text-white shadow-lg"
+        >
+          {generateResult.message}
+          <button
+            onClick={() => setGenerateResult(null)}
+            className="ml-3 text-amber-200 hover:text-white"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {generateResult?.type === "success" && (
         <div
           data-testid="generate-success"

@@ -99,9 +99,12 @@ async function handler(req: NextRequest): Promise<NextResponse> {
     majorRequirements: input.majorRequirements.map((c) => c.code),
   };
 
-  validateAISchedule(validationInput); // logs errors internally; we surface the plan regardless
+  const validationResult = validateAISchedule(validationInput);
+  const warnings = validationResult.valid
+    ? []
+    : validationResult.errors.map((e) => e.message);
 
-  return NextResponse.json({ success: true, plan: result.plan }, { status: 200 });
+  return NextResponse.json({ success: true, plan: result.plan, warnings }, { status: 200 });
 }
 
 export const POST = withLogging(handler as Parameters<typeof withLogging>[0]);
