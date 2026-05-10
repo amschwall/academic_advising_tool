@@ -1,8 +1,8 @@
 // file: components/WhatIfModal.tsx
 "use client";
 
-import React from "react";
-import { useWhatIfStore } from "@/lib/stores/whatIfStore";
+import React, { useState } from "react";
+import { useWhatIfStore, type WhatIfMode } from "@/lib/stores/whatIfStore";
 import { MAJORS, MINORS, CONCENTRATIONS } from "@/lib/data/majors";
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,9 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
     setConcentration,
   } = useWhatIfStore();
 
+  // Local state for the mode choice — default to "requirements"
+  const [selectedMode, setSelectedMode] = useState<WhatIfMode>("requirements");
+
   if (!open) return null;
 
   function handleMajorChange(e: React.ChangeEvent<HTMLSelectElement>) {
@@ -48,7 +51,7 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
   }
 
   function handleRunAnalysis() {
-    activate();
+    activate(selectedMode);
   }
 
   function handleClearAnalysis() {
@@ -162,6 +165,41 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
                 </option>
               ))}
             </select>
+          </div>
+
+          {/* Mode selection */}
+          <div>
+            <p className="mb-2 text-xs font-medium text-gray-600">What would you like to do?</p>
+            <div className="space-y-2">
+              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 px-4 py-3 transition-colors hover:border-green-300 hover:bg-green-50 has-[:checked]:border-green-500 has-[:checked]:bg-green-50">
+                <input
+                  type="radio"
+                  name="what-if-mode"
+                  value="requirements"
+                  checked={selectedMode === "requirements"}
+                  onChange={() => setSelectedMode("requirements")}
+                  className="mt-0.5 accent-green-700"
+                />
+                <div>
+                  <p className="text-sm font-medium text-gray-800">View Requirements Only</p>
+                  <p className="text-xs text-gray-500">Show the selected major's requirements in the tracker — no schedule changes.</p>
+                </div>
+              </label>
+              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 px-4 py-3 transition-colors hover:border-green-300 hover:bg-green-50 has-[:checked]:border-green-500 has-[:checked]:bg-green-50">
+                <input
+                  type="radio"
+                  name="what-if-mode"
+                  value="generate"
+                  checked={selectedMode === "generate"}
+                  onChange={() => setSelectedMode("generate")}
+                  className="mt-0.5 accent-green-700"
+                />
+                <div>
+                  <p className="text-sm font-medium text-gray-800">View Requirements + Generate Schedule</p>
+                  <p className="text-xs text-gray-500">Show requirements and automatically place courses in your schedule.</p>
+                </div>
+              </label>
+            </div>
           </div>
         </div>
 

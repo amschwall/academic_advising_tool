@@ -4,6 +4,8 @@
 import React, { useState, useMemo } from "react";
 import {
   MAJORS,
+  MINORS,
+  CONCENTRATIONS,
   COLL_CURRICULUM,
   MajorRequirementItem,
   CourseRequirement,
@@ -13,6 +15,7 @@ import {
 } from "@/lib/data/majors";
 import { usePlannerStore, PlannedCourse, CourseStatus } from "@/lib/stores/plannerStore";
 import { useStudentStore } from "@/lib/stores/studentStore";
+import { useWhatIfStore } from "@/lib/stores/whatIfStore";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -466,6 +469,7 @@ export function RequirementsView() {
   const totalPlanned = useMemo(() => planned.reduce((s, c) => s + c.credits, 0), [planned]);
 
   const student = useStudentStore();
+  const whatIf  = useWhatIfStore();
 
   // Determine if the student has a declared major matching one of our program definitions
   const declaredMajor = useMemo(() => {
@@ -478,10 +482,34 @@ export function RequirementsView() {
   const isUndeclared = !declaredMajor;
 
   const [selectedMajor, setSelectedMajor] = useState<string>(MAJORS[0].name);
-  const majorDef = useMemo(
+
+  // Base major definition (student's real declared major, or selector for undeclared)
+  const baseMajorDef = useMemo(
     () => declaredMajor ?? MAJORS.find((m) => m.name === selectedMajor) ?? MAJORS[0],
     [declaredMajor, selectedMajor],
   );
+
+  // When a what-if analysis is active, swap in the what-if programs.
+  const effectiveMajorDef = useMemo(() => {
+    if (whatIf.active && whatIf.major) {
+      return MAJORS.find((m) => m.name === whatIf.major) ?? baseMajorDef;
+    }
+    return baseMajorDef;
+  }, [whatIf.active, whatIf.major, baseMajorDef]);
+
+  const effectiveMinorDef = useMemo(() => {
+    if (whatIf.active && whatIf.minor) {
+      return MINORS.find((m) => m.name === whatIf.minor) ?? null;
+    }
+    return null;
+  }, [whatIf.active, whatIf.minor]);
+
+  const effectiveConcentrationDef = useMemo(() => {
+    if (whatIf.active && whatIf.concentration) {
+      return CONCENTRATIONS.find((c) => c.name === whatIf.concentration) ?? null;
+    }
+    return null;
+  }, [whatIf.active, whatIf.concentration]);
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden bg-gray-50">
@@ -489,6 +517,31 @@ export function RequirementsView() {
       {/* ── Scrollable content ───────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-6 py-6">
         <div className="flex flex-col gap-5 max-w-3xl mx-auto">
+
+          {/* ── What-if banner ───────────────────────────────────────────── */}
+          {whatIf.active && (
+            <div className="flex items-center justify-between rounded-xl border border-purple-200 bg-purple-50 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-purple-800">What-If Analysis</span>
+                <span className="text-sm text-purple-600">
+                  — viewing requirements for{" "}
+                  <span className="font-medium">{whatIf.major ?? "undeclared"}</span>
+                  {whatIf.minor && (
+                    <> + <span className="font-medium">{whatIf.minor}</span> minor</>
+                  )}
+                  {whatIf.concentration && (
+                    <> ({whatIf.concentration} concentration)</>
+                  )}
+                </span>
+              </div>
+              <button
+                onClick={() => whatIf.deactivate()}
+                className="text-xs text-purple-400 hover:text-purple-700 transition-colors"
+              >
+                Exit
+              </button>
+            </div>
+          )}
 
           {/* ── Student info card ────────────────────────────────────────── */}
           <section className="rounded-2xl bg-white shadow-sm ring-1 ring-gray-100">
@@ -506,7 +559,7 @@ export function RequirementsView() {
 
           {/* ── Credits summary + optional major selector ─────────────────── */}
           <div className="flex flex-wrap items-center gap-4 rounded-2xl bg-white px-5 py-3 shadow-sm ring-1 ring-gray-100">
-            {isUndeclared && (
+            {isUndeclared && !whatIf.active && (
               <div className="flex items-center gap-2">
                 <label htmlFor="major-select" className="text-sm font-medium text-gray-600">
                   Viewing requirements for:
@@ -525,7 +578,7 @@ export function RequirementsView() {
                 </select>
               </div>
             )}
-            <div className={`${isUndeclared ? "" : "w-full"} flex items-center gap-1.5 text-sm text-gray-500 ${isUndeclared ? "ml-auto" : ""}`}>
+            <div className={`${isUndeclared && !whatIf.active ? "ml-auto" : "w-full"} flex items-center gap-1.5 text-sm text-gray-500`}>
               <span className="font-semibold text-gray-800">{totalPlanned}</span>
               <span>credits planned</span>
             </div>
@@ -537,8 +590,14 @@ export function RequirementsView() {
             </div>
           )}
 
-          <RequirementSection program={majorDef}        planned={planned} />
-          <RequirementSection program={COLL_CURRICULUM} planned={planned} />
+          <RequirementSection program={effectiveMajorDef}        planned={planned} />
+          {effectiveConcentrationDef && (
+            <RequirementSection program={effectiveConcentrationDef} planned={planned} />
+          )}
+          {effectiveMinorDef && (
+            <RequirementSection program={effectiveMinorDef}        planned={planned} />
+          )}
+          <RequirementSection program={COLL_CURRICULUM}           planned={planned} />
         </div>
       </div>
     </div>
