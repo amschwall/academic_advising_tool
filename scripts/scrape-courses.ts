@@ -1,14 +1,15 @@
 // scripts/scrape-courses.ts
 //
-// Scrapes the W&M FOSE registration API and upserts Course + Section rows.
+// Scrapes the W&M FOSE registration API and upserts Course + Section rows,
+// including prerequisites and major-enrollment restrictions.
 //
 // Usage:
 //   npx tsx scripts/scrape-courses.ts [term]
 //
-// term defaults to 202620 (Spring 2026).
-// Available term codes follow the pattern YYYYSS: 10=Fall, 20=Spring, 30=Summer.
-//   202510 = Fall 2025    202520 = Spring 2025
-//   202610 = Fall 2026    202620 = Spring 2026
+// term defaults to 202610 (Fall 2025).
+// Available term codes: YYYYSS where SS = 10=Fall, 20=Spring, 30=Summer.
+//   202510 = Fall 2024    202520 = Spring 2025
+//   202610 = Fall 2025    202620 = Spring 2026
 
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
@@ -47,10 +48,87 @@ interface FoseMeetingTime {
 
 interface FoseDetail {
   description: string;
-  hours_html: string;        // "4 Credit Hours"
-  attributes_all: string;    // HTML <ul> of attribute labels
-  all_sections: string;      // HTML grid with room column
+  hours_html: string;               // "4 Credit Hours"
+  attributes_all: string;           // text of attribute labels
+  all_sections: string;             // HTML grid with room column
+  registration_restrictions: string; // HTML with prereq/maj/lvl paragraphs
+  course_coreqs: string;            // plain text coreqs e.g. "CSCI 141L"
 }
+
+// ---------------------------------------------------------------------------
+// Major name → department code mapping
+// ---------------------------------------------------------------------------
+// Covers W&M major names that appear in restriction text.
+
+const MAJOR_NAME_TO_DEPT: Record<string, string> = {
+  "accounting":                    "BUAD",
+  "africana studies":              "AFST",
+  "american studies":              "AMST",
+  "anthropology":                  "ANTH",
+  "applied science":               "APSC",
+  "arabic":                        "ARAB",
+  "art and art history":           "ARTH",
+  "art history":                   "ARTH",
+  "arts and sciences":             "COLL",
+  "asian and middle eastern studies": "AMES",
+  "biology":                       "BIOL",
+  "biophysics":                    "BPHY",
+  "business":                      "BUAD",
+  "chemistry":                     "CHEM",
+  "chinese":                       "CHIN",
+  "classical studies":             "CLST",
+  "cognitive science":             "COGS",
+  "computational and applied mathematics": "CAMA",
+  "computational biology":         "CBIO",
+  "computer science":              "CSCI",
+  "creative writing":              "ENGL",
+  "data science":                  "DATA",
+  "economics":                     "ECON",
+  "education":                     "EDUC",
+  "english":                       "ENGL",
+  "environmental science":         "ENSP",
+  "environmental policy":          "ENSP",
+  "environmental studies":         "ENSP",
+  "film and media studies":        "FMST",
+  "finance":                       "BUAD",
+  "french":                        "FREN",
+  "gender, sexuality and women's studies": "GSWS",
+  "geology":                       "GEOL",
+  "german":                        "GERM",
+  "government":                    "GOVT",
+  "greek":                         "GREK",
+  "history":                       "HIST",
+  "international relations":       "INTR",
+  "italian":                       "ITAL",
+  "japanese":                      "JAPN",
+  "kinesiology":                   "KINE",
+  "latin":                         "LATN",
+  "latin american studies":        "LAST",
+  "law":                           "LAW",
+  "linguistics":                   "LING",
+  "management":                    "BUAD",
+  "marketing":                     "BUAD",
+  "mathematics":                   "MATH",
+  "medieval & renaissance studies":"MDVL",
+  "middle eastern studies":        "MESA",
+  "music":                         "MUSC",
+  "neuroscience":                  "NEUR",
+  "philosophy":                    "PHIL",
+  "physics":                       "PHYS",
+  "political science":             "GOVT",
+  "portuguese":                    "PORT",
+  "psychology":                    "PSYC",
+  "public health":                 "PBHL",
+  "public policy":                 "PPOL",
+  "religion":                      "RELG",
+  "russian":                       "RUSS",
+  "sociology":                     "SOCL",
+  "spanish":                       "HISP",
+  "studio art":                    "ARTS",
+  "theatre":                       "THEA",
+  "theatre and speech":            "THEA",
+  "women's studies":               "GSWS",
+};
 
 // ---------------------------------------------------------------------------
 // Term helpers
@@ -78,7 +156,6 @@ function parseDays(meetingTimesJson: string): string | null {
     };
     const seen = new Set(times.map((t) => MAP[t.meet_day] ?? ""));
     const unique = Array.from(seen).filter(Boolean);
-    // sort by day order M-T-W-R-F
     const ORDER = ["M","T","W","R","F"];
     unique.sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
     return unique.join("") || null;
@@ -87,14 +164,14 @@ function parseDays(meetingTimesJson: string): string | null {
   }
 }
 
-/** Convert "1000" → "10:00am", "930" or "0930" → "9:30am", "1350" → "1:50pm". */
+/** Convert "1000" → "10:00 AM", "930" → "9:30 AM", "1350" → "1:50 PM". */
 function formatTime(hhmm: string): string {
   const padded = hhmm.padStart(4, "0");
   const h = parseInt(padded.slice(0, 2), 10);
   const m = padded.slice(2);
-  const suffix = h < 12 ? "am" : "pm";
+  const suffix = h < 12 ? "AM" : "PM";
   const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-  return `${h12}:${m}${suffix}`;
+  return `${h12}:${m} ${suffix}`;
 }
 
 /** Parse start/end times from meetingTimes JSON (uses first entry). */
@@ -124,20 +201,17 @@ function parseCredits(cartOptsJson: string): number {
   }
 }
 
-/** Extract COLL attribute ("COLL 100", "COLL 200", etc.) from attributes HTML.
- *  The API returns e.g. "College 150 (C150)" or "College 200 (C200)". */
-function parseCollAttribute(attributesHtml: string): string | null {
-  // Match the parenthesised code: (C100), (C150), (C200), (C300), (C350), (C500)
-  const match = attributesHtml.match(/\(C(\d{3})\)/);
+/** Extract COLL attribute from attributes text. */
+function parseCollAttribute(attributesText: string): string | null {
+  const match = attributesText.match(/\(C(\d{3})\)/);
   if (match) return `COLL ${match[1]}`;
-  // Fallback: plain "College NNN" text
-  const fallback = attributesHtml.match(/College\s+(\d{3})/i);
+  const fallback = attributesText.match(/College\s+(\d{3})/i);
   return fallback ? `COLL ${fallback[1]}` : null;
 }
 
-/** Extract NQR/ALV/CSI boolean flags from attributes HTML. */
-function parseGenEdFlags(attributesHtml: string): { alv: boolean; nqr: boolean; csi: boolean } {
-  const lower = attributesHtml.toLowerCase();
+/** Extract NQR/ALV/CSI boolean flags from attributes text. */
+function parseGenEdFlags(attributesText: string): { alv: boolean; nqr: boolean; csi: boolean } {
+  const lower = attributesText.toLowerCase();
   return {
     nqr: lower.includes("nqr") || lower.includes("nat world quant"),
     alv: lower.includes("alv") || lower.includes("arts, lit") || lower.includes("arts &amp; lit"),
@@ -160,14 +234,65 @@ function parseRooms(allSectionsHtml: string): Map<string, string> {
       if (crn && room) rooms.set(crn, room);
     }
   } catch {
-    // ignore parse errors — rooms will be null
+    // ignore parse errors
   }
   return rooms;
 }
 
-/** Strip HTML tags from a string. */
+/** Strip HTML tags. */
 function stripHtml(html: string): string {
   return parseHtml(html).text.trim();
+}
+
+/**
+ * Extract prerequisite course codes (e.g. ["CSCI241", "MATH214"]) from the
+ * registration_restrictions HTML.  Looks for the <p class="prereq"> paragraph
+ * and pulls out all course codes, including abbreviated forms where the subject
+ * is omitted (e.g. "ART 313 and 314" → ["ART313", "ART314"]).
+ */
+function parsePrerequisiteCodes(restrictionsHtml: string): string[] {
+  if (!restrictionsHtml) return [];
+  const prereqMatch = restrictionsHtml.match(/class="prereq">([\s\S]*?)<\/p>/i);
+  if (!prereqMatch) return [];
+  const text = stripHtml(prereqMatch[1]);
+
+  // Walk through tokens: "SUBJ NNN" sets the current subject; bare "NNN"
+  // inherits it.  This handles "ART 313 and 314" → ART313, ART314.
+  const codes: string[] = [];
+  let lastSubj: string | null = null;
+  const TOKEN = /\b([A-Z]{2,4})\s+(\d{3,4})\b|\b(\d{3,4})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = TOKEN.exec(text)) !== null) {
+    if (m[1]) {
+      // Full "SUBJ NNN" match
+      lastSubj = m[1];
+      codes.push(`${lastSubj}${m[2]}`);
+    } else if (m[3] && lastSubj) {
+      // Bare number — inherit the last seen subject
+      codes.push(`${lastSubj}${m[3]}`);
+    }
+  }
+  // Deduplicate while preserving order
+  return [...new Map(codes.map((c) => [c, c])).values()];
+}
+
+/**
+ * Extract the department code for a major-enrollment restriction.
+ * Returns null when there is no <p class="maj"> or no matching department.
+ *
+ * Example input: "Enrollment is limited to students with a major in Computer Science."
+ * Returns: "CSCI"
+ */
+function parseMajorRestriction(restrictionsHtml: string): string | null {
+  if (!restrictionsHtml) return null;
+  const majMatch = restrictionsHtml.match(/class="maj">([\s\S]*?)<\/p>/i);
+  if (!majMatch) return null;
+  const text = stripHtml(majMatch[1]).toLowerCase();
+  // Look for "major in X" or "major or minor in X"
+  const nameMatch = text.match(/major(?:\s+or\s+minor)?\s+in\s+([a-z &,']+?)(?:\.|$)/);
+  if (!nameMatch) return null;
+  const majorName = nameMatch[1].trim().replace(/\s+/g, " ");
+  return MAJOR_NAME_TO_DEPT[majorName] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +321,9 @@ async function fetchCourseDetail(code: string, srcdb: string): Promise<FoseDetai
       body: JSON.stringify({ group: `code:${code}`, srcdb }),
     });
     if (!res.ok) return null;
-    return await res.json() as FoseDetail;
+    const data = await res.json();
+    // API returns an array for some multi-section courses
+    return Array.isArray(data) ? data[0] : data as FoseDetail;
   } catch {
     return null;
   }
@@ -211,7 +338,7 @@ function sleep(ms: number) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const srcdb = process.argv[2] ?? "202620";
+  const srcdb = process.argv[2] ?? "202610";
   const { season, year } = termToSeasonYear(srcdb);
   const term = srcdb;
 
@@ -230,69 +357,67 @@ async function main() {
   const uniqueCodes = Array.from(byCourse.keys());
   console.log(`\nStep 2: found ${uniqueCodes.length} unique courses\n`);
 
-  // Step 3: for each course fetch detail (description, attributes, rooms)
+  // Step 3: upsert courses + sections, collect prerequisite data for pass 2
   let processed = 0;
-  let inserted = 0;
+  let upserted = 0;
   let errors = 0;
+
+  // prereqMap[courseCode] = list of prerequisite course codes (e.g. ["CSCI241","MATH214"])
+  const prereqMap = new Map<string, string[]>();
 
   for (const code of uniqueCodes) {
     const courseSections = byCourse.get(code)!;
     const first = courseSections[0];
 
-    // Parse department ("CSCI 141" → "CSCI", "141")
     const parts = code.trim().split(/\s+/);
     const department = parts[0];
     const courseNumber = parts.slice(1).join("");
-    const courseCode = `${department}${courseNumber}`; // "CSCI141"
+    const courseCode = `${department}${courseNumber}`; // e.g. "CSCI141"
 
-    // Credits from first section's cart_opts
     const credits = parseCredits(first.cart_opts);
 
-    // Fetch detail for description, attributes, room per section
     await sleep(DELAY_MS);
     const detail = await fetchCourseDetail(code, srcdb);
 
     let description: string | null = null;
     let collAttribute: string | null = null;
-    let alv = false;
-    let nqr = false;
-    let csi = false;
+    let alv = false, nqr = false, csi = false;
+    let majorRestriction: string | null = null;
     let rooms = new Map<string, string>();
 
     if (detail) {
-      description = detail.description ? stripHtml(detail.description) : null;
-      collAttribute = parseCollAttribute(detail.attributes_all ?? "");
-      const flags = parseGenEdFlags(detail.attributes_all ?? "");
-      alv = flags.alv;
-      nqr = flags.nqr;
-      csi = flags.csi;
-      rooms = parseRooms(detail.all_sections ?? "");
+      description     = detail.description ? stripHtml(detail.description) : null;
+      collAttribute   = parseCollAttribute(detail.attributes_all ?? "");
+      const flags     = parseGenEdFlags(detail.attributes_all ?? "");
+      alv = flags.alv; nqr = flags.nqr; csi = flags.csi;
+      rooms           = parseRooms(detail.all_sections ?? "");
+      majorRestriction = parseMajorRestriction(detail.registration_restrictions ?? "");
+
+      const prereqCodes = parsePrerequisiteCodes(detail.registration_restrictions ?? "");
+      if (prereqCodes.length > 0) prereqMap.set(courseCode, prereqCodes);
     }
 
     try {
-      // Upsert course
       const course = await prisma.course.upsert({
         where: { code: courseCode },
         update: {
-          title:         first.title,
+          title: first.title,
           credits,
           description,
           department,
           collAttribute,
-          alv,
-          nqr,
-          csi,
+          alv, nqr, csi,
+          majorRestriction,
         },
         create: {
-          code:          courseCode,
-          title:         first.title,
+          code: courseCode,
+          title: first.title,
           credits,
           description,
           department,
           collAttribute,
-          alv,
-          nqr,
-          csi,
+          alv, nqr, csi,
+          majorRestriction,
         },
       });
 
@@ -306,37 +431,12 @@ async function main() {
 
         await prisma.section.upsert({
           where: { crn: s.crn },
-          update: {
-            section:    s.no,
-            term,
-            year,
-            season,
-            days,
-            startTime,
-            endTime,
-            location,
-            instructor,
-            status,
-            courseId:   course.id,
-          },
-          create: {
-            crn:        s.crn,
-            section:    s.no,
-            term,
-            year,
-            season,
-            days,
-            startTime,
-            endTime,
-            location,
-            instructor,
-            status,
-            courseId:   course.id,
-          },
+          update: { section: s.no, term, year, season, days, startTime, endTime, location, instructor, status, courseId: course.id },
+          create: { crn: s.crn, section: s.no, term, year, season, days, startTime, endTime, location, instructor, status, courseId: course.id },
         });
       }
 
-      inserted++;
+      upserted++;
     } catch (err) {
       errors++;
       console.error(`  ERROR on ${courseCode}:`, (err as Error).message);
@@ -344,16 +444,48 @@ async function main() {
 
     processed++;
     if (processed % 50 === 0) {
-      console.log(`  Progress: ${processed}/${uniqueCodes.length} courses (${errors} errors)`);
+      console.log(`  Progress: ${processed}/${uniqueCodes.length} (${errors} errors)`);
     }
   }
 
-  const courseCount = await prisma.course.count();
-  const sectionCount = await prisma.section.count();
+  console.log(`\nStep 3 complete: ${upserted} courses upserted (${errors} errors)\n`);
 
-  console.log(`\nDone!`);
-  console.log(`  Courses upserted: ${inserted} (${errors} errors)`);
-  console.log(`  Total in DB — courses: ${courseCount}, sections: ${sectionCount}`);
+  // Step 4: resolve and write Prerequisite links
+  console.log("Step 4: writing prerequisite links...");
+  let prereqLinked = 0;
+  let prereqSkipped = 0;
+
+  for (const [courseCode, prereqCodes] of prereqMap) {
+    const course = await prisma.course.findUnique({ where: { code: courseCode } });
+    if (!course) { prereqSkipped++; continue; }
+
+    for (const prereqCode of prereqCodes) {
+      const prereq = await prisma.course.findUnique({ where: { code: prereqCode } });
+      if (!prereq) { prereqSkipped++; continue; }
+
+      try {
+        await prisma.prerequisite.upsert({
+          where: { courseId_prerequisiteId: { courseId: course.id, prerequisiteId: prereq.id } },
+          update: {},
+          create: { courseId: course.id, prerequisiteId: prereq.id },
+        });
+        prereqLinked++;
+      } catch {
+        prereqSkipped++;
+      }
+    }
+  }
+
+  const courseCount   = await prisma.course.count();
+  const sectionCount  = await prisma.section.count();
+  const prereqCount   = await prisma.prerequisite.count();
+  const restrictedCount = await prisma.course.count({ where: { majorRestriction: { not: null } } });
+
+  console.log(`\n✓ Done!`);
+  console.log(`  Courses in DB:           ${courseCount}`);
+  console.log(`  Sections in DB:          ${sectionCount}`);
+  console.log(`  Prerequisite links:      ${prereqCount} (${prereqLinked} added, ${prereqSkipped} skipped/missing)`);
+  console.log(`  Major-restricted courses: ${restrictedCount}`);
 
   await prisma.$disconnect();
 }
