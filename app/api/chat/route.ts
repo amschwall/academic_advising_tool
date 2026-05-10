@@ -1,6 +1,6 @@
 // file: app/api/chat/route.ts
 import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { recordUsage } from "@/lib/cost/tracker";
 
 // ---------------------------------------------------------------------------
@@ -67,18 +67,18 @@ function buildContextNote(ctx: RequestBody["context"]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Singleton Anthropic client
+// Singleton OpenAI client
 // ---------------------------------------------------------------------------
 
-let _anthropic: Anthropic | null = null;
+let _openai: OpenAI | null = null;
 
-function getClient(): Anthropic {
-  if (!_anthropic) {
-    const apiKey = process.env.CLAUDE_API_KEY;
-    if (!apiKey) throw new Error("CLAUDE_API_KEY is not set");
-    _anthropic = new Anthropic({ apiKey });
+function getClient(): OpenAI {
+  if (!_openai) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+    _openai = new OpenAI({ apiKey });
   }
-  return _anthropic;
+  return _openai;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,45 +100,51 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   // Inject student context into the first user turn
   const contextNote = buildContextNote(context);
-  const anthropicMessages: Anthropic.MessageParam[] = messages.map((m, i) => ({
-    role:    m.role as "user" | "assistant",
-    content: i === 0 && m.role === "user" ? m.content + contextNote : m.content,
-  }));
+  const openaiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...messages.map((m, i) => ({
+      role:    m.role as "user" | "assistant",
+      content: i === 0 && m.role === "user" ? m.content + contextNote : m.content,
+    })),
+  ];
 
-  let client: Anthropic;
+  let client: OpenAI;
   try {
     client = getClient();
   } catch (err) {
     console.error("[/api/chat] client init error:", err);
-    return new Response("CLAUDE_API_KEY not configured", { status: 500 });
+    return new Response("OPENAI_API_KEY not configured", { status: 500 });
   }
 
-  // ── Stream via Anthropic SDK ─────────────────────────────────────────────
+  // ── Stream via OpenAI SDK ────────────────────────────────────────────────
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        const sdkStream = await client.messages.stream({
-          model:      "claude-sonnet-4-6",
+        const sdkStream = await client.chat.completions.create({
+          model:      "gpt-4o",
           max_tokens: 1024,
-          system:     SYSTEM_PROMPT,
-          messages:   anthropicMessages,
+          messages:   openaiMessages,
+          stream:     true,
+          stream_options: { include_usage: true },
         });
 
-        for await (const event of sdkStream) {
-          if (
-            event.type === "content_block_delta" &&
-            event.delta.type === "text_delta"
-          ) {
-            const chunk = JSON.stringify({ text: event.delta.text });
-            controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+        let inputTokens = 0;
+        let outputTokens = 0;
+
+        for await (const chunk of sdkStream) {
+          const delta = chunk.choices[0]?.delta?.content;
+          if (delta) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: delta })}\n\n`));
+          }
+          if (chunk.usage) {
+            inputTokens  = chunk.usage.prompt_tokens;
+            outputTokens = chunk.usage.completion_tokens;
           }
         }
 
-        // Capture token usage and record cost
-        const final = await sdkStream.finalMessage();
-        recordUsage(final.usage.input_tokens, final.usage.output_tokens);
+        recordUsage(inputTokens, outputTokens);
 
         // Signal done
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));

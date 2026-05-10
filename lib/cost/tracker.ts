@@ -1,5 +1,5 @@
 // file: lib/cost/tracker.ts
-// Tracks cumulative Claude API spend across dev sessions.
+// Tracks cumulative OpenAI API spend across dev sessions.
 // Writes to .cost-tracker.json at the project root (gitignored).
 
 import fs   from "fs";
@@ -7,9 +7,9 @@ import path from "path";
 
 const USAGE_FILE = path.join(process.cwd(), ".cost-tracker.json");
 
-// claude-sonnet-4-6 pricing
-const INPUT_COST_PER_TOKEN  = 3.00  / 1_000_000;
-const OUTPUT_COST_PER_TOKEN = 15.00 / 1_000_000;
+// gpt-4o pricing
+const INPUT_COST_PER_TOKEN  = 2.50  / 1_000_000;
+const OUTPUT_COST_PER_TOKEN = 10.00 / 1_000_000;
 
 const MILESTONE_INTERVAL = 0.50; // dollars
 

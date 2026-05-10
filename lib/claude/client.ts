@@ -17,7 +17,7 @@ const FALLBACK: RecommendationResponse = { text: FALLBACK_MESSAGE, isFallback: t
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RPM = 10;
 const RATE_WINDOW_MS = 60_000;
-const MODEL = "claude-sonnet-4-6";
+const MODEL = "gpt-4o";
 const MAX_TOKENS = 1024;
 
 /** Extracts the text string from an Anthropic API response envelope. */
