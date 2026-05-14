@@ -23,12 +23,14 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
     open,
     active,
     major,
+    secondMajor,
     minor,
     concentration,
     closeModal,
     activate,
     reset: resetWhatIf,
     setMajor,
+    setSecondMajor,
     setMinor,
     setConcentration,
   } = useWhatIfStore();
@@ -39,7 +41,14 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
   if (!open) return null;
 
   function handleMajorChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    setMajor(e.target.value || null);
+    const val = e.target.value || null;
+    setMajor(val);
+    // Clear second major if it's the same as the newly selected primary
+    if (val && secondMajor === val) setSecondMajor(null);
+  }
+
+  function handleSecondMajorChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    setSecondMajor(e.target.value || null);
   }
 
   function handleMinorChange(e: React.ChangeEvent<HTMLSelectElement>) {
@@ -88,8 +97,7 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
         <div className="px-6 py-5 space-y-5">
           {/* Declared major display */}
           <div className="rounded-lg bg-green-50 px-4 py-3 text-sm text-green-800 ring-1 ring-green-100">
-            Your declared major:{" "}
-            <span className="font-semibold">{declaredMajor}</span>
+            Your declared major: <span className="font-semibold">{declaredMajor}</span>
           </div>
 
           {/* Major selector */}
@@ -110,6 +118,31 @@ export function WhatIfModal({ declaredMajor = "Undecided" }: Props) {
             >
               <option value="">-- Select a major --</option>
               {MAJORS.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Second major selector */}
+          <div>
+            <label
+              htmlFor="what-if-second-major"
+              className="mb-1 block text-xs font-medium text-gray-600"
+            >
+              Second Major <span className="text-gray-400">(optional)</span>
+            </label>
+            <select
+              id="what-if-second-major"
+              value={secondMajor ?? ""}
+              onChange={handleSecondMajorChange}
+              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm
+                         text-gray-800 shadow-sm focus:border-green-500 focus:outline-none
+                         focus:ring-2 focus:ring-green-100"
+            >
+              <option value="">None</option>
+              {MAJORS.filter((m) => m.name !== major).map((m) => (
                 <option key={m.name} value={m.name}>
                   {m.name}
                 </option>

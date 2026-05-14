@@ -3,6 +3,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import Link from "next/link";
+import { LogoutButton } from "@/components/LogoutButton";
 import {
   DndContext,
   DragOverlay,
@@ -35,7 +36,7 @@ interface Course {
   title: string;
   credits: number;
   prerequisiteCodes: string[];
-  sections: { professor: string; location: string; days: string; startTime?: string | null; endTime?: string | null }[];
+  sections: { crn?: string; season?: string; professor: string; location: string; days: string; startTime?: string | null; endTime?: string | null }[];
   collAttribute?: string | null;
   alv?: boolean;
   csi?: boolean;
@@ -180,6 +181,7 @@ function formatHour(totalMins: number): string {
 function buildRequirementsFromPrograms(
   programs: ProgramDefinition[],
   availableCourses: Course[],
+  completedCodes: Set<string> = new Set(),
 ): {
   majorRequirements:    GeneratorInput["majorRequirements"];
   electivePool:         GeneratorInput["electivePool"];
@@ -199,12 +201,16 @@ function buildRequirementsFromPrograms(
       // No explicit restriction: allow only courses from known program departments
       // or courses with gen-ed / COLL flags (open to all students).
       return allKnownDepts.has(c.department ?? "") ||
+             majorDepts.has(c.department ?? "") ||
              c.alv || c.csi || c.nqr || !!c.collAttribute;
     })
   );
   const seenRequired      = new Set<string>();
+  const seenElective      = new Set<string>();
   const syntheticFallback = new Map<string, Course>();
   const majorRequirements: GeneratorInput["majorRequirements"] = [];
+  const electivePool:      GeneratorInput["electivePool"]      = [];
+  let electiveCreditsNeeded = 0;
   let synIdx = 0;
 
   function toGenCourse(c: Course): GeneratorInput["majorRequirements"][number] {
@@ -219,8 +225,25 @@ function buildRequirementsFromPrograms(
 
   function addRequired(entry: GeneratorInput["majorRequirements"][number]) {
     if (seenRequired.has(entry.code)) return;
+    // If this course was tentatively chosen as an elective, promote it to
+    // required (hard requirement always takes precedence).
+    if (seenElective.has(entry.code)) {
+      const idx = electivePool.findIndex((e) => e.code === entry.code);
+      if (idx >= 0) {
+        electiveCreditsNeeded -= electivePool[idx].credits;
+        electivePool.splice(idx, 1);
+      }
+      seenElective.delete(entry.code);
+    }
     seenRequired.add(entry.code);
     majorRequirements.push(entry);
+  }
+
+  function addElective(entry: GeneratorInput["electivePool"][number]) {
+    if (seenRequired.has(entry.code) || seenElective.has(entry.code)) return;
+    seenElective.add(entry.code);
+    electivePool.push(entry);
+    electiveCreditsNeeded += entry.credits;
   }
 
   /** Create a synthetic placeholder course and add it to majorRequirements. */
@@ -256,6 +279,8 @@ function buildRequirementsFromPrograms(
         });
 
       // ── Credit-hour requirement ───────────────────────────────────────────
+      // Elective selections go into electivePool (placed AFTER required courses),
+      // so required courses are always distributed evenly across semesters first.
       } else if (req.type === "credits") {
         const hasFilter = !!(req.departments || req.minLevel);
         let covered = 0;
@@ -272,76 +297,153 @@ function buildRequirementsFromPrograms(
             covered += entry.credits;
           }
 
-          if (req.electiveCourses && req.electiveCourses.length > 0) {
-            // Approved elective list — shuffle and pick, skipping courses whose
-            // prerequisites are not already in the required set. This prevents the
-            // generator from dragging in unexpected prerequisite chains just to
-            // satisfy an elective slot.
-            const shuffled = [...req.electiveCourses].sort(() => Math.random() - 0.5);
-            for (const elec of shuffled) {
-              if (covered >= req.credits) break;
-              if (seenRequired.has(elec.code)) continue;
-              // Prefer DB version (has section info + real prereqs).
-              const dbCourse = courseMap.get(elec.code);
-              const prereqs = dbCourse?.prerequisiteCodes ?? [];
-              // Skip this elective if any of its prerequisites are not already
-              // in the required set — we don't want to force-add prereq chains
-              // just to satisfy an elective credit requirement.
-              if (prereqs.some((p) => !seenRequired.has(p))) continue;
-              addRequired(
-                dbCourse
-                  ? toGenCourse(dbCourse)
-                  : { code: elec.code, credits: elec.credits, prerequisiteCodes: [], collAttribute: null, seasons: ["FALL", "SPRING"] as Season[] }
+          const netNeeded = req.credits - covered;
+          if (netNeeded > 0) {
+            if (req.electiveCourses && req.electiveCourses.length > 0) {
+              // Approved elective list — sort by level so lower-level courses
+              // (and their prereqs) are processed first, then shuffle within each level.
+              const byLevel = [...req.electiveCourses].sort(
+                (a, b) => extractCourseLevel(a.code) - extractCourseLevel(b.code)
               );
-              // Add to syntheticFallback if not in DB so the UI can render it
-              if (!dbCourse) {
-                syntheticFallback.set(elec.code, {
-                  code: elec.code, title: elec.title, credits: elec.credits,
-                  prerequisiteCodes: [], sections: [], collAttribute: null,
-                });
+              let electiveCovered = 0;
+              // Two passes: first pass respects prereq constraints; second pass
+              // relaxes them (adds course without prereq filtering) to ensure
+              // credit requirements are always fully covered.
+              for (let pass = 0; pass < 2 && electiveCovered < netNeeded; pass++) {
+                for (const elec of byLevel) {
+                  if (electiveCovered >= netNeeded) break;
+                  if (seenRequired.has(elec.code) || seenElective.has(elec.code)) continue;
+                  const dbCourse = courseMap.get(elec.code);
+                  const prereqs  = dbCourse?.prerequisiteCodes ?? [];
+                  // Pass 0: prereqs must already be required or elected or completed.
+                  // Pass 1: relax — accept any remaining approved elective.
+                  if (pass === 0 && prereqs.some(
+                    (p) => !seenRequired.has(p) && !seenElective.has(p) && !completedCodes.has(p)
+                  )) continue;
+                  const genCourse = dbCourse
+                    ? toGenCourse(dbCourse)
+                    : { code: elec.code, credits: elec.credits, prerequisiteCodes: [], collAttribute: null, seasons: ["FALL", "SPRING"] as Season[] };
+                  addElective(genCourse);
+                  if (!dbCourse) {
+                    syntheticFallback.set(elec.code, {
+                      code: elec.code, title: elec.title, credits: elec.credits,
+                      prerequisiteCodes: [], sections: [], collAttribute: null,
+                    });
+                  }
+                  electiveCovered += elec.credits;
+                }
               }
-              covered += elec.credits;
-            }
-          } else {
-            // No approved list — fall back to catalog filtering (shuffled for variety).
-            // Cap at level 400; graduate courses (500+) must be placed manually.
-            // Skip courses whose prerequisites are not already in the required set.
-            for (const course of shuffledCourses) {
-              if (covered >= req.credits) break;
-              if (seenRequired.has(course.code)) continue;
-              if (extractCourseLevel(course.code) >= 500) continue;
-              if (req.departments && !req.departments.includes(course.department ?? "")) continue;
-              if (req.minLevel && extractCourseLevel(course.code) < req.minLevel) continue;
-              if (course.prerequisiteCodes.some((p) => !seenRequired.has(p))) continue;
-              addRequired(toGenCourse(course));
-              covered += course.credits;
+              // Synthetic fallback: if still short, add a placeholder so the credit
+              // requirement is always fully represented in the generated schedule.
+              if (electiveCovered < netNeeded) {
+                addSynthetic(netNeeded - electiveCovered, req.description, "ELEC");
+              }
+            } else if (req.singleDepartment && req.departments && req.departments.length > 0) {
+              // Single-department sequential requirement (e.g. foreign language).
+              // Pick ONE department at random, then add its courses in level order
+              // so the generator enforces 101 → 102 → 201 → 202 sequencing.
+              const shuffledDepts = shuffle([...req.departments]);
+              let electiveCovered = 0;
+
+              for (const dept of shuffledDepts) {
+                if (electiveCovered >= netNeeded) break;
+
+                // All available courses from this department, sorted by level ascending.
+                const deptCourses = shuffledCourses
+                  .filter(
+                    (c) =>
+                      c.department === dept &&
+                      !seenRequired.has(c.code) &&
+                      !seenElective.has(c.code) &&
+                      extractCourseLevel(c.code) < 500
+                  )
+                  .sort((a, b) => extractCourseLevel(a.code) - extractCourseLevel(b.code));
+
+                if (deptCourses.length === 0) continue;
+
+                // Build the chain in level order. Allow a course whose prereq is
+                // already in `tentative` (i.e. FREN 102 can follow FREN 101 even
+                // though FREN 101 is not yet in seenRequired/seenElective).
+                const tentative: GeneratorInput["electivePool"][number][] = [];
+                let deptCovered = 0;
+                for (const course of deptCourses) {
+                  if (deptCovered >= netNeeded) break;
+                  const prereqsOk = course.prerequisiteCodes.every(
+                    (p) =>
+                      seenRequired.has(p) ||
+                      seenElective.has(p) ||
+                      completedCodes.has(p) ||
+                      tentative.some((t) => t.code === p)
+                  );
+                  if (!prereqsOk) continue;
+                  tentative.push(toGenCourse(course));
+                  deptCovered += course.credits;
+                }
+
+                if (tentative.length === 0) continue;
+
+                // Commit: add the chosen department's sequence to the elective pool.
+                for (const entry of tentative) {
+                  addElective(entry);
+                  electiveCovered += entry.credits;
+                }
+                break; // Only one language department per schedule.
+              }
+
+              // Synthetic fallback: if no language courses were found (e.g. not yet
+              // in the catalog), add a placeholder so the credit block is still represented.
+              if (electiveCovered < netNeeded) {
+                addSynthetic(netNeeded - electiveCovered, req.description, "LANG");
+              }
+            } else {
+              // No approved list — fall back to catalog filtering.
+              // We intentionally do NOT check prereqs here: the generator filters
+              // its prereqMap to known-course codes only, so unknown DB prereqs
+              // are ignored and will not block placement.  Checking prereqs here
+              // would unnecessarily exclude valid courses (e.g. every HIST 300+
+              // course would be skipped by a CS student because HIST 101 is not
+              // in their seenRequired/seenElective).
+              let electiveCovered = 0;
+              for (const course of shuffledCourses) {
+                if (electiveCovered >= netNeeded) break;
+                if (seenRequired.has(course.code) || seenElective.has(course.code)) continue;
+                // Only place elective/gen-ed catalog courses at the 100/200 level.
+                if (extractCourseLevel(course.code) > 200) continue;
+                if (req.departments && !req.departments.includes(course.department ?? "")) continue;
+                if (req.minLevel && extractCourseLevel(course.code) < req.minLevel) continue;
+                addElective(toGenCourse(course));
+                electiveCovered += course.credits;
+              }
+              // Synthetic fallback if catalog didn't have enough matching courses.
+              if (electiveCovered < netNeeded) {
+                addSynthetic(netNeeded - electiveCovered, req.description, "ELEC");
+              }
             }
           }
-        }
-        // No-filter requirements (e.g. COLL 100/150 seminars) are never satisfied
-        // by existing courses — they represent distinct course types not in the
-        // simplified catalog, so we synthesize placeholders directly.
-
-        // Synthesize any remaining shortfall
-        let rem = req.credits - covered;
-        while (rem > 0) {
-          const cr  = Math.min(rem, 3);
-          const tag = `${req.departments?.[0] ?? "COLL"}${req.minLevel ?? ""}`;
-          addSynthetic(cr, req.description, tag);
-          rem -= cr;
+        } else {
+          // No-filter requirements (e.g. COLL seminars) represent distinct structured
+          // experiences not in the regular catalog — synthesize required placeholders.
+          let rem = req.credits;
+          while (rem > 0) {
+            const cr  = Math.min(rem, 3);
+            const tag = `COLL`;
+            addSynthetic(cr, req.description, tag);
+            rem -= cr;
+          }
         }
 
       // ── Gen-ed attribute requirement (ALV / CSI / NQR) ───────────────────
+      // These are required (student must earn this gen-ed), so they go in
+      // majorRequirements, not the elective pool.
       } else {
         let addedCount = 0;
 
-        // Cap at level 400 — graduate courses (500+) must be placed manually.
         for (const course of shuffledCourses) {
           if (addedCount >= req.count) break;
           if (seenRequired.has(course.code)) continue;
-          if (extractCourseLevel(course.code) >= 500) continue;
+          // Only satisfy gen-ed requirements with 100/200-level courses.
+          if (extractCourseLevel(course.code) > 200) continue;
 
-          // Match on boolean gen-ed flags first, then fall back to collAttribute string
           const flagMap: Record<string, keyof Course> = { alv: "alv", csi: "csi", nqr: "nqr" };
           const flagKey = flagMap[req.attribute.toLowerCase()];
           const matches = flagKey
@@ -353,7 +455,6 @@ function buildRequirementsFromPrograms(
           addedCount++;
         }
 
-        // Synthesize any missing gen-ed slots
         for (let i = addedCount; i < req.count; i++) {
           addSynthetic(req.credits, req.description, req.attribute);
         }
@@ -362,25 +463,20 @@ function buildRequirementsFromPrograms(
   }
 
   // ── Transitive prerequisite closure ────────────────────────────────────────
-  // After all program requirements are collected, scan every required course's
-  // prerequisiteCodes and pull in any that are not yet in the plan.  Repeat
-  // until stable so multi-level chains (e.g. ART420→ART325, ART412→ART324→ART211)
-  // are fully resolved.  Auto-added courses are treated as required (guaranteed
-  // placement) so the generator never has to place a course whose prereq is
-  // absent from the plan.
-  //
-  // Skip synthetic placeholders — they represent COLL / gen-ed slots that have
-  // no real catalog entry and therefore no real prerequisites.
+  // Pull in any prereqs of required courses that aren't yet in the plan.
+  // We only run the closure over majorRequirements — elective prereqs were
+  // already validated (only electives whose prereqs are in seenRequired were
+  // added), so their chains are already covered.
   {
     let changed = true;
     while (changed) {
       changed = false;
       for (const req of [...majorRequirements]) {
-        if (syntheticFallback.has(req.code)) continue; // synthetic — no real prereqs
+        if (syntheticFallback.has(req.code)) continue;
         for (const prereqCode of req.prerequisiteCodes) {
-          if (seenRequired.has(prereqCode)) continue;  // already in plan
+          if (seenRequired.has(prereqCode)) continue;
           const prereqCourse = courseMap.get(prereqCode);
-          if (!prereqCourse) continue;                 // not in catalog — skip
+          if (!prereqCourse) continue;
           addRequired(toGenCourse(prereqCourse));
           changed = true;
         }
@@ -388,13 +484,13 @@ function buildRequirementsFromPrograms(
     }
   }
 
-  // All requirements are now in majorRequirements (guaranteed placement).
-  // electivePool and electiveCreditsNeeded are intentionally empty — free
-  // electives are handled separately via fillPool in "complete" mode.
+  // Required courses are guaranteed placement (step 6 of the generator).
+  // Electives fill remaining space afterward (step 7), ensuring required
+  // courses are spread evenly across semesters before any elective lands.
   return {
     majorRequirements,
-    electivePool:          [],
-    electiveCreditsNeeded: 0,
+    electivePool,
+    electiveCreditsNeeded,
     syntheticFallback,
   };
 }
@@ -489,8 +585,22 @@ function PlacedCourseCard({
   if (course.csi)           genEdBadges.push("CSI");
   if (course.nqr)           genEdBadges.push("NQR");
 
+  const status = course.status ?? "planned";
+  const cardCls =
+    status === "completed"   ? "border-green-200  bg-green-50  border-l-green-500"  :
+    status === "in-progress" ? "border-yellow-200 bg-yellow-50 border-l-yellow-500" :
+                               "border-blue-100   bg-blue-50   border-l-blue-400";
+  const titleCls =
+    status === "completed"   ? "text-green-900"  :
+    status === "in-progress" ? "text-yellow-900" :
+                               "text-blue-900";
+  const subtitleCls =
+    status === "completed"   ? "text-green-600"  :
+    status === "in-progress" ? "text-yellow-600" :
+                               "text-blue-500";
+
   return (
-    <div className="rounded-lg border border-gray-100 bg-white shadow-sm">
+    <div className={`rounded-lg border border-l-2 shadow-sm ${cardCls}`}>
       {/* ── Summary row ── */}
       <div className="flex items-center gap-1 px-3 py-2">
         <button
@@ -508,8 +618,8 @@ function PlacedCourseCard({
         </button>
 
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-gray-800">{course.title}</p>
-          <p className="text-xs text-gray-400">
+          <p className={`truncate text-sm font-medium ${titleCls}`}>{course.title}</p>
+          <p className={`text-xs ${subtitleCls}`}>
             {course.code} &middot; {course.credits} cr
             {course.department && ` · ${course.department}`}
           </p>
@@ -961,10 +1071,16 @@ function SemesterColumn({
 export function CoursePlanner({
   availableCourses,
   declaredMajor,
+  declaredSecondMajor,
+  declaredMinor,
 }: {
   availableCourses: Course[];
   /** Student's declared major from their profile. "Undecided" or undefined means they must pick one. */
   declaredMajor?: string;
+  /** Student's declared second major, if any. */
+  declaredSecondMajor?: string;
+  /** Student's declared minor from their profile, if any. */
+  declaredMinor?: string;
 }) {
   const {
     semesters,
@@ -976,14 +1092,44 @@ export function CoursePlanner({
     isDuplicate,
     pendingChanges,
     clearPendingChanges,
+    loadSchedule,
   } = usePlannerStore();
+
+  // Load saved schedule from DB on mount
+  const scheduleLoaded = useRef(false);
+  useEffect(() => {
+    if (scheduleLoaded.current || availableCourses.length === 0) return;
+    scheduleLoaded.current = true;
+
+    fetch("/api/schedule")
+      .then((r) => r.ok ? r.json() : { items: [] })
+      .then(({ items }) => {
+        if (!items?.length) return;
+        const courseMap = new Map(availableCourses.map((c) => [c.code, c]));
+        const mapped = (items as Array<{ year: number; season: "FALL" | "SPRING"; completed: boolean; grade?: string | null; course: { code: string } }>)
+          .map((item) => {
+            const full = courseMap.get(item.course.code);
+            if (!full) return null;
+            return { year: item.year, season: item.season, completed: item.completed, grade: item.grade ?? null, course: full };
+          })
+          .filter(Boolean) as Array<{ year: number; season: "FALL" | "SPRING"; completed: boolean; grade?: string | null; course: typeof availableCourses[0] }>;
+        loadSchedule(mapped);
+      })
+      .catch(() => {/* non-fatal */});
+  }, [availableCourses, loadSchedule]);
 
   const [activeCourse, setActiveCourse]   = useState<Course | null>(null);
   const [notification, setNotification]   = useState<Notification | null>(null);
   const [saving, setSaving]               = useState(false);
-  const [search, setSearch]               = useState("");
   const [chatOpen, setChatOpen]           = useState(false);
-  const [viewMode, setViewMode]           = useState<"calendar" | "grid">("calendar");
+
+  // ── Catalog search filters ────────────────────────────────────────────────
+  const [searchTitle, setSearchTitle]   = useState("");
+  const [searchCode,  setSearchCode]    = useState("");
+  const [searchDept,  setSearchDept]    = useState("");
+  const [searchLevel, setSearchLevel]   = useState("");
+  const [searchColl,  setSearchColl]    = useState("");
+  const [viewMode, setViewMode]           = useState<"calendar" | "grid">("grid");
 
   // Default to the first in-progress semester, first non-empty, or Year 1 Fall.
   const [selectedSemesterId, setSelectedSemesterId] = useState<string>(() => {
@@ -1008,12 +1154,30 @@ export function CoursePlanner({
   // Program selections
   const [genMajor, setGenMajor]               = useState(isUndeclared ? "" : (declaredMajor ?? ""));
   const [genSecondMajor, setGenSecondMajor]   = useState("");
-  const [genMinor, setGenMinor]               = useState("");
+  const [genMinor, setGenMinor]               = useState(declaredMinor ?? "");
   const [genConcentration, setGenConcentration] = useState("");
   // "major-only" → place only program requirements (no fill, no COLL)
   // "complete"   → program requirements + COLL gen-ed + fill all semesters
-  const [genMode, setGenMode]                 = useState<"major-only" | "complete">("major-only");
-  const [genIncludeColl, setGenIncludeColl]   = useState(true);
+  const [genMode, setGenMode]                 = useState<"major-only" | "complete">("complete");
+
+  // Sync declared major/minor/second major into modal state after Zustand store hydrates
+  useEffect(() => {
+    if (declaredMajor && declaredMajor !== "Undecided") {
+      setGenMajor(declaredMajor);
+    }
+  }, [declaredMajor]);
+
+  useEffect(() => {
+    if (declaredSecondMajor) {
+      setGenSecondMajor(declaredSecondMajor);
+    }
+  }, [declaredSecondMajor]);
+
+  useEffect(() => {
+    if (declaredMinor) {
+      setGenMinor(declaredMinor);
+    }
+  }, [declaredMinor]);
 
   // Concentrations applicable to the currently selected major(s)
   const applicableConcentrations = CONCENTRATIONS.filter((c) => {
@@ -1045,6 +1209,7 @@ export function CoursePlanner({
       lastGenerateTrigger.current = whatIf.generateTriggerCount;
       handleGenerateRef.current?.({
         major:         whatIf.major         ?? undefined,
+        secondMajor:   whatIf.secondMajor   ?? undefined,
         minor:         whatIf.minor         ?? undefined,
         concentration: whatIf.concentration ?? undefined,
       });
@@ -1067,13 +1232,23 @@ export function CoursePlanner({
     (s) => s.courses.reduce((sum, c) => sum + c.credits, 0) > 18
   );
 
-  const filteredCourses = search.trim()
-    ? availableCourses.filter(
-        (c) =>
-          c.title.toLowerCase().includes(search.toLowerCase()) ||
-          c.code.toLowerCase().includes(search.toLowerCase())
-      )
-    : availableCourses;
+  const searchActive = !!(searchTitle || searchCode || searchDept || searchLevel || searchColl);
+
+  const filteredCourses = searchActive
+    ? availableCourses.filter((c) => {
+        if (searchTitle && !c.title.toLowerCase().includes(searchTitle.toLowerCase())) return false;
+        if (searchCode  && !c.code.toLowerCase().includes(searchCode.toLowerCase()))  return false;
+        if (searchDept  && c.department !== searchDept)  return false;
+        if (searchLevel) {
+          const lvl = parseInt(searchLevel, 10);
+          const m = c.code.match(/(\d{3})/);
+          const cLvl = m ? Math.floor(parseInt(m[1], 10) / 100) * 100 : 0;
+          if (cLvl !== lvl) return false;
+        }
+        if (searchColl  && c.collAttribute !== searchColl) return false;
+        return true;
+      })
+    : [];
 
   // Group semesters by year; anything beyond year 4 goes in "Extra"
   const byYear = new Map<number, Semester[]>();
@@ -1095,9 +1270,16 @@ export function CoursePlanner({
     // Pool card: id === course.code
     const fromPool = availableCourses.find((c) => c.code === id);
     if (fromPool) return fromPool;
-    // Chat recommendation card: id === `chat-rec-${code}`, data carries the full course
-    if (id.startsWith("chat-rec-") && active.data?.current) {
-      return active.data.current as Course;
+    // Chat recommendation card: id === `chat-rec-${code}`
+    // Extract the code from the id and look up the full course from the catalog.
+    // This is more reliable than active.data?.current which can be stale after
+    // the chat panel re-renders while dragging.
+    if (id.startsWith("chat-rec-")) {
+      const code = id.slice("chat-rec-".length);
+      const fromCatalog = availableCourses.find((c) => c.code === code);
+      if (fromCatalog) return fromCatalog;
+      // Fallback: course not in catalog (e.g. AI hallucinated a code), use drag data
+      if (active.data?.current) return active.data.current as Course;
     }
     return null;
   }
@@ -1165,30 +1347,70 @@ export function CoursePlanner({
     setGenerating(true);
     setGenerateResult(null);
 
-    // Clear any existing courses so the generated schedule starts fresh
+    try {
+    // Snapshot completed courses BEFORE clearing — we need to restore them
+    // after generation so they stay in their original semesters, and pass them
+    // to the generator so it knows not to re-place them.
+    const preClearSemesters = usePlannerStore.getState().semesters;
+    type SavedCompleted = { semId: string; course: PlannedCourse; year: number; season: "FALL" | "SPRING" };
+    const savedCompleted: SavedCompleted[] = [];
+    for (const sem of preClearSemesters) {
+      for (const c of sem.courses) {
+        if (c.status === "completed") {
+          savedCompleted.push({ semId: sem.id, course: c, year: sem.year, season: sem.season });
+        }
+      }
+    }
+
+    // Clear all courses so the generated schedule starts fresh
     clearAllCourses();
+
+    // Restore completed courses immediately — they must be present in the store
+    // before the generated plan is applied so the slot-collision check skips them.
+    for (const { semId, course } of savedCompleted) {
+      addCourse(semId, course);
+    }
 
     const isComplete = genMode === "complete";
 
-    // Collect selected programs
+    // Collect selected programs.
+    // COLL_CURRICULUM is always included — W&M gen-ed requirements (ALV, CSI, NQR,
+    // foreign language, proficiencies) are mandatory for every student regardless
+    // of which schedule type is selected.
     const selectedPrograms: ProgramDefinition[] = [
       MAJORS.find((m) => m.name === effectiveMajor)!,
       ...(effectiveSecondMajor ? [MAJORS.find((m) => m.name === effectiveSecondMajor)!] : []),
       ...(effectiveMinor ? [MINORS.find((m) => m.name === effectiveMinor)!] : []),
       ...(effectiveConc ? [CONCENTRATIONS.find((c) => c.name === effectiveConc)!] : []),
-      // COLL gen-ed only in "complete" mode
-      ...(isComplete && genIncludeColl ? [COLL_CURRICULUM] : []),
+      COLL_CURRICULUM,
     ].filter(Boolean);
 
-    // Read fresh store state — clearAllCourses() updates the store synchronously
-    // but the React closure still holds the pre-clear semesters snapshot.
+    // Read fresh store state (after restoring completed courses).
     const freshSemesters = usePlannerStore.getState().semesters;
-    const targetSemesters = freshSemesters.slice(0, genSemesters);
-    // Everything was just cleared, so the full catalog is available for planning.
-    const unplacedCourses = availableCourses;
+    // Exclude semesters that already contain completed courses — those are locked.
+    const targetSemesters = freshSemesters
+      .slice(0, genSemesters)
+      .filter((s) => !s.courses.some((c) => c.status === "completed"));
+
+    // Build the completed-courses list for the generator (code + credits + where they live).
+    const completedCoursesForGen: GeneratorInput["completedCourses"] = savedCompleted.map(
+      ({ course, year, season }) => ({
+        code:    course.code,
+        credits: course.credits,
+        year,
+        season,
+      }),
+    );
+
+    // Completed course codes — exclude these from the unplaced catalog so
+    // buildRequirementsFromPrograms doesn't try to re-add them as requirements.
+    const completedCodeSet = new Set(completedCoursesForGen.map((c) => c.code));
+
+    // Courses available for new placement (catalog minus already-completed).
+    const unplacedCourses = availableCourses.filter((c) => !completedCodeSet.has(c.code));
 
     const { majorRequirements, electivePool, electiveCreditsNeeded, syntheticFallback } =
-      buildRequirementsFromPrograms(selectedPrograms, unplacedCourses);
+      buildRequirementsFromPrograms(selectedPrograms, unplacedCourses, completedCodeSet);
 
     // In "complete" mode, pass every remaining catalog course as a fill pool so
     // the generator brings all semesters up to the target credit load.
@@ -1202,9 +1424,13 @@ export function CoursePlanner({
       ? shuffle(
           unplacedCourses.filter((c) => {
             if (scheduledCodes.has(c.code)) return false;
-            if (extractCourseLevel(c.code) >= 500) return false;
+            // Fill pool is capped at 200-level — no elective filler above 200.
+            if (extractCourseLevel(c.code) > 200) return false;
             if (c.majorRestriction) return majorDepts.has(c.majorRestriction);
+            // majorDepts includes language/arts depts from COLL_CURRICULUM (always included),
+            // so this correctly admits FREN, MUSC, THEA, etc. for fill slots.
             return allKnownDepts2.has(c.department ?? "") ||
+                   majorDepts.has(c.department ?? "") ||
                    c.alv || c.csi || c.nqr || !!c.collAttribute;
           })
         ).map((c) => ({
@@ -1216,20 +1442,45 @@ export function CoursePlanner({
           }))
       : undefined;
 
+    // Build availableSections: map each course's known sections to every planned
+    // semester whose season matches. Since scraped data is one term (e.g. Spring 2026),
+    // we treat it as a proxy for future semesters of the same season.
+    const availableSections: Record<string, import("@/lib/generator/types").SectionOption[]> = {};
+    for (const course of availableCourses) {
+      if (!course.sections.length) continue;
+      const opts: import("@/lib/generator/types").SectionOption[] = [];
+      for (const sec of course.sections) {
+        if (!sec.crn || !sec.season) continue;
+        const secSeason = sec.season as Season;
+        for (const sem of targetSemesters) {
+          if (sem.season !== secSeason) continue;
+          opts.push({
+            id:        `${sec.crn}-yr${sem.year}`,
+            crn:       sec.crn,
+            days:      sec.days || null,
+            startTime: sec.startTime ?? null,
+            endTime:   sec.endTime   ?? null,
+            year:      sem.year,
+            season:    secSeason,
+          });
+        }
+      }
+      if (opts.length) availableSections[course.code] = opts;
+    }
+
     const input: GeneratorInput = {
       student:           { id: "local-student", catalogYear: new Date().getFullYear() },
-      completedCourses:  [],
+      completedCourses:  completedCoursesForGen,
       majorRequirements,
       collRequirements:  [],
       electivePool,
       electiveCreditsNeeded,
       plannedSemesters:  targetSemesters.map((s) => ({ year: s.year, season: s.season as Season })),
-      availableSections: {},
+      availableSections,
       preferences:       { avoidEarlyMorning: genAvoidEarly, noFridayClasses: genNoFriday, maxCreditsPerSemester: genMaxCredits },
       fillPool,
     };
 
-    try {
       const res = await fetch("/api/schedule/generate", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
@@ -1296,11 +1547,64 @@ export function CoursePlanner({
         }
       }
 
+      // Helper: minutes since midnight from "H:MM AM/PM" format
+      function timeToMinutes(t: string | null | undefined): number | null {
+        if (!t) return null;
+        const upper = t.trim().toUpperCase();
+        const isPm  = upper.endsWith("PM");
+        const clean = upper.slice(0, -2).trim();
+        const colon = clean.indexOf(":");
+        if (colon < 0) return null;
+        let h = parseInt(clean.slice(0, colon), 10);
+        const m = parseInt(clean.slice(colon + 1), 10);
+        if (isPm && h !== 12) h += 12;
+        if (!isPm && h === 12) h = 0;
+        return h * 60 + m;
+      }
+      const EARLY_CUTOFF = 9 * 60 + 30;
+
+      // Check which placed courses could only be scheduled in a way that violates prefs.
+      const fridayViolations: string[]      = [];
+      const earlyViolations:  string[]      = [];
+
+      for (const genSem of plan.semesters) {
+        const semLabel = `Year ${genSem.year} ${genSem.season === "FALL" ? "Fall" : "Spring"}`;
+        for (const placed of genSem.courses) {
+          const course = availableCourses.find((c) => c.code === placed.code);
+          if (!course || !course.sections.length) continue;
+          const seasonSections = course.sections.filter((s) => s.season === genSem.season);
+          if (seasonSections.length === 0) continue;
+
+          if (genNoFriday) {
+            const allFriday = seasonSections.every((s) => s.days && s.days.includes("F"));
+            if (allFriday) fridayViolations.push(`${placed.code} (${semLabel})`);
+          }
+          if (genAvoidEarly) {
+            const allEarly = seasonSections.every((s) => {
+              const mins = timeToMinutes(s.startTime);
+              return mins !== null && mins < EARLY_CUTOFF;
+            });
+            if (allEarly) earlyViolations.push(`${placed.code} (${semLabel})`);
+          }
+        }
+      }
+
       const warnings: string[] = data.warnings ?? [];
-      if (warnings.length > 0) {
+      const prefWarnings: string[] = [];
+      if (fridayViolations.length > 0)
+        prefWarnings.push(`only Friday sections available: ${fridayViolations.join(", ")}`);
+      if (earlyViolations.length > 0)
+        prefWarnings.push(`only early-morning sections available: ${earlyViolations.join(", ")}`);
+
+      if (prefWarnings.length > 0) {
         setGenerateResult({
           type: "warning",
-          message: `Schedule generated with ${warnings.length} prerequisite issue(s). Some courses may need to be placed manually.`,
+          message: `Schedule generated. Scheduling preferences could not be fully honored — ${prefWarnings.join("; ")}.`,
+        });
+      } else if (warnings.length > 0) {
+        setGenerateResult({
+          type: "warning",
+          message: `Schedule generated, but ${warnings.length} course${warnings.length !== 1 ? "s were" : " was"} placed out of prerequisite order. Review the plan and adjust manually if needed.`,
         });
       } else {
         setGenerateResult({ type: "success", message: "Schedule generated successfully!" });
@@ -1346,10 +1650,27 @@ export function CoursePlanner({
         {/* ── Top bar ────────────────────────────────────────────────────── */}
         <header className="flex shrink-0 items-center justify-between border-b border-gray-200 bg-white px-6 py-3 shadow-sm">
           <div className="flex items-center gap-6">
-            <div>
-              <h1 className="text-lg font-bold text-green-900">Four-Year Planner</h1>
-              <p className="text-xs text-gray-400">William &amp; Mary Academic Advising</p>
-            </div>
+            {/* Logo */}
+            <Link href="/planner" className="flex items-center gap-2.5 select-none">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" className="w-8 h-8 shrink-0">
+                <path d="M32 6 C20 6 10 16 10 27 C10 39 32 58 32 58 C32 58 54 39 54 27 C54 16 44 6 32 6Z" fill="#1a5c38"/>
+                <circle cx="32" cy="27" r="8" fill="white"/>
+                <circle cx="10" cy="56" r="3" fill="#c8a951"/>
+                <circle cx="21" cy="59" r="2" fill="#c8a951" fillOpacity="0.6"/>
+                <circle cx="43" cy="59" r="2" fill="#c8a951" fillOpacity="0.6"/>
+                <circle cx="54" cy="56" r="3" fill="#c8a951"/>
+                <line x1="13" y1="56" x2="19" y2="59" stroke="#c8a951" strokeWidth="1.5" strokeDasharray="2,2"/>
+                <line x1="23" y1="59" x2="41" y2="59" stroke="#c8a951" strokeWidth="1.5" strokeDasharray="2,2"/>
+                <line x1="45" y1="59" x2="51" y2="56" stroke="#c8a951" strokeWidth="1.5" strokeDasharray="2,2"/>
+              </svg>
+              <div>
+                <span className="text-lg font-bold leading-none" style={{ fontFamily: "Georgia, serif", color: "#1a5c38" }}>
+                  Degree<span style={{ color: "#b8941e" }}>Map</span>
+                </span>
+                <p className="text-[10px] text-gray-400 leading-none mt-0.5">William &amp; Mary</p>
+              </div>
+            </Link>
+
             <nav className="flex items-center gap-1">
               <Link
                 href="/planner"
@@ -1440,6 +1761,7 @@ export function CoursePlanner({
                 {pendingChanges.length} unsaved
               </span>
             )}
+            <LogoutButton />
           </div>
         </header>
 
@@ -1543,7 +1865,7 @@ export function CoursePlanner({
             <main className={["flex-1 overflow-y-auto px-6 py-5", chatOpen ? "min-w-0" : ""].join(" ")}>
               <div className="mb-4">
                 <p className="text-xs text-gray-400">
-                  Drag courses from the right panel into a semester. Click a semester on the left for Calendar View.
+                  Search for courses on the right, then drag them into a semester. Click a semester on the left for Calendar View.
                 </p>
               </div>
               <div className="flex flex-col gap-8">
@@ -1582,50 +1904,180 @@ export function CoursePlanner({
                   title: c.title,
                   credits: c.credits,
                 }))}
+                onAddCourse={(entry) => {
+                  const full = availableCourses.find((c) => c.code === entry.code);
+                  if (!full) return;
+                  const targetId = selectedSemesterId ?? semesters[0]?.id;
+                  if (!targetId) return;
+                  if (!isPrereqSatisfied(targetId, full)) {
+                    const { semesters: allSems } = usePlannerStore.getState();
+                    const semIdx = allSems.findIndex((s) => s.id === targetId);
+                    const earlierCodes = new Set<string>();
+                    for (let i = 0; i < semIdx; i++) allSems[i].courses.forEach((c) => earlierCodes.add(c.code));
+                    const missing = full.prerequisiteCodes.filter((p) => !earlierCodes.has(p));
+                    setNotification({ type: "error", message: `${full.code} requires ${missing.join(", ")} — place ${missing.length === 1 ? "it" : "them"} in an earlier semester first.` });
+                    return;
+                  }
+                  addCourse(targetId, full);
+                  setNotification({ type: "success", message: `${full.code} added to ${semesters.find(s => s.id === targetId)?.label ?? "semester"}.` });
+                }}
               />
             </aside>
           )}
 
-          {/* ── Right: Course catalog ─────────────────────────────────────── */}
-          <aside
-            data-testid="course-pool"
-            className="flex w-72 shrink-0 flex-col border-l border-gray-200 bg-white"
-          >
+          {/* ── Right: Search results (only when a filter is active) ──────── */}
+          {searchActive && (
+            <aside
+              data-testid="course-pool"
+              className="flex w-72 shrink-0 flex-col border-l border-gray-200 bg-white"
+            >
+              {/* Results header */}
+              <div className="shrink-0 border-b border-gray-100 px-4 py-2.5 flex items-center justify-between">
+                <span className="text-xs text-gray-500">
+                  <span className="font-semibold text-gray-700">{filteredCourses.length}</span>{" "}
+                  result{filteredCourses.length !== 1 ? "s" : ""}
+                </span>
+                {viewMode === "calendar" && selectedSemester && (
+                  <span className="text-[10px] text-gray-400">
+                    Drop → <span className="font-medium text-green-700">{selectedSemester.label}</span>
+                  </span>
+                )}
+              </div>
+
+              {/* Scrollable course cards */}
+              <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-3">
+                {filteredCourses.length === 0 ? (
+                  <p className="mt-8 text-center text-xs text-gray-300">No courses match your search.</p>
+                ) : (
+                  filteredCourses.map((course) => (
+                    <DraggableCourseCard
+                      key={course.code}
+                      course={course}
+                      isPlaced={placedCodes.has(course.code)}
+                    />
+                  ))
+                )}
+              </div>
+            </aside>
+          )}
+
+          {/* ── Right: Course search filters (always visible) ─────────────── */}
+          <aside className="flex w-60 shrink-0 flex-col border-l border-gray-200 bg-white overflow-y-auto">
             <div className="shrink-0 border-b border-gray-100 px-4 py-3">
-              <h2 className="mb-2 text-sm font-semibold text-gray-700">Course Catalog</h2>
-              <input
-                type="search"
-                placeholder="Search by name or code…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="w-full rounded-lg border border-gray-200 px-3 py-1.5 text-xs
-                           text-gray-700 placeholder-gray-300 focus:border-green-400
-                           focus:outline-none focus:ring-2 focus:ring-green-100"
-              />
-              {viewMode === "calendar" && selectedSemester && (
-                <p className="mt-1.5 text-[10px] text-gray-400">
-                  Drop onto calendar → adds to{" "}
-                  <span className="font-medium text-green-700">{selectedSemester.label}</span>
-                </p>
-              )}
+              <p className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">
+                Course Catalog
+              </p>
             </div>
-            <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-3">
-              {filteredCourses.length === 0 && (
-                <p className="mt-8 text-center text-xs text-gray-300">No courses match your search.</p>
-              )}
-              {filteredCourses.map((course) => (
-                <DraggableCourseCard
-                  key={course.code}
-                  course={course}
-                  isPlaced={placedCodes.has(course.code)}
+
+            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+              {/* Title / keyword */}
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-gray-400">
+                  Title / Keyword
+                </p>
+                <input
+                  type="text"
+                  value={searchTitle}
+                  onChange={(e) => setSearchTitle(e.target.value)}
+                  placeholder="e.g. Algorithms"
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm
+                             text-gray-800 placeholder-gray-400 focus:border-green-600
+                             focus:outline-none focus:ring-1 focus:ring-green-200"
                 />
-              ))}
+              </div>
+
+              {/* Course code */}
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-gray-400">
+                  Course Code
+                </p>
+                <input
+                  type="text"
+                  value={searchCode}
+                  onChange={(e) => setSearchCode(e.target.value)}
+                  placeholder="e.g. CSCI301"
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm
+                             text-gray-800 placeholder-gray-400 focus:border-green-600
+                             focus:outline-none focus:ring-1 focus:ring-green-200"
+                />
+              </div>
+
+              {/* Department */}
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-gray-400">
+                  Department
+                </p>
+                <select
+                  value={searchDept}
+                  onChange={(e) => setSearchDept(e.target.value)}
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm
+                             text-gray-800 focus:border-green-600 focus:outline-none focus:ring-1 focus:ring-green-200"
+                >
+                  <option value="">All departments</option>
+                  {["AMST","ANTH","ARTH","BIOL","CHEM","CHIN","CLCV","CSCI","DATA","ECON",
+                    "EDUC","ENGL","FREN","GEOL","GERM","GOVT","HISP","HIST","ITAL","JAPN",
+                    "KINE","LING","MATH","MUSC","PHIL","PHYS","PSYC","RELG","RUSS","SOCL",
+                    "THEA","WGSS"].map((d) => (
+                    <option key={d} value={d}>{d}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Course level */}
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-gray-400">
+                  Course Level
+                </p>
+                <select
+                  value={searchLevel}
+                  onChange={(e) => setSearchLevel(e.target.value)}
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm
+                             text-gray-800 focus:border-green-600 focus:outline-none focus:ring-1 focus:ring-green-200"
+                >
+                  <option value="">Any level</option>
+                  {[100, 200, 300, 400].map((l) => (
+                    <option key={l} value={String(l)}>{l}-level</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* COLL attribute */}
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-gray-400">
+                  COLL Attribute
+                </p>
+                <select
+                  value={searchColl}
+                  onChange={(e) => setSearchColl(e.target.value)}
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm
+                             text-gray-800 focus:border-green-600 focus:outline-none focus:ring-1 focus:ring-green-200"
+                >
+                  <option value="">Any</option>
+                  {["COLL 100","COLL 150","COLL 200","COLL 300","COLL 350","COLL 400"].map((l) => (
+                    <option key={l} value={l}>{l}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Reset */}
+              {searchActive && (
+                <button
+                  onClick={() => {
+                    setSearchTitle(""); setSearchCode("");
+                    setSearchDept(""); setSearchLevel(""); setSearchColl("");
+                  }}
+                  className="w-full rounded-lg border border-gray-200 py-2 text-xs font-medium
+                             text-gray-500 hover:border-red-300 hover:text-red-500 transition-colors"
+                >
+                  Reset filters
+                </button>
+              )}
             </div>
           </aside>
         </div>
 
         {/* ── Requirement tracker (expandable, below grid) ────────────────── */}
-        <RequirementTracker />
+        <RequirementTracker declaredMajor={declaredMajor} declaredMinor={declaredMinor} />
       </div>
 
       {/* ── Generate Schedule modal ─────────────────────────────────────────── */}
@@ -1795,9 +2247,9 @@ export function CoursePlanner({
                       className="mt-0.5 text-green-600 focus:ring-green-500"
                     />
                     <div>
-                      <p className="text-sm font-medium text-gray-800">Program requirements only</p>
+                      <p className="text-sm font-medium text-gray-800">Requirements only</p>
                       <p className="text-xs text-gray-500 mt-0.5">
-                        Place exactly the courses and credits required by your selected major, minor, and concentration.
+                        Place all required courses — major, gen-ed (ALV, CSI, NQR), foreign language, and COLL proficiencies. No free elective filler.
                       </p>
                     </div>
                   </label>
@@ -1813,25 +2265,12 @@ export function CoursePlanner({
                     <div>
                       <p className="text-sm font-medium text-gray-800">Complete 4-year plan</p>
                       <p className="text-xs text-gray-500 mt-0.5">
-                        Program requirements + gen-ed + free electives to fill every semester to the credit target.
+                        All requirements + free electives to bring every semester up to the credit target.
                       </p>
                     </div>
                   </label>
                 </div>
               </fieldset>
-
-              {/* COLL gen-ed — only in complete mode */}
-              {genMode === "complete" && (
-                <label className="flex cursor-pointer items-center gap-2 text-sm text-gray-700">
-                  <input
-                    type="checkbox"
-                    checked={genIncludeColl}
-                    onChange={(e) => setGenIncludeColl(e.target.checked)}
-                    className="rounded border-gray-300 text-green-600 focus:ring-green-500"
-                  />
-                  Include W&amp;M COLL gen-ed requirements (ALV, CSI, NQR…)
-                </label>
-              )}
 
               {/* Scheduling preferences */}
               <fieldset>
