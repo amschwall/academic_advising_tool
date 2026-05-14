@@ -21,11 +21,14 @@ const TARGET_CREDITS = 15;
 // ---------------------------------------------------------------------------
 
 function parseTimeToMinutes(timeStr: string): number {
-  const isPm = timeStr.endsWith("pm");
-  const clean = timeStr.slice(0, -2);
+  // Normalize — DB stores "10:00 AM" / "1:30 PM" (space + uppercase);
+  // legacy data may use "10:00am" / "1:30pm" (no space, lowercase).
+  const upper    = timeStr.trim().toUpperCase();
+  const isPm     = upper.endsWith("PM");
+  const clean    = upper.slice(0, -2).trim(); // strip "AM"/"PM" and surrounding space
   const colonIdx = clean.indexOf(":");
-  let hour = parseInt(clean.slice(0, colonIdx), 10);
-  const min = parseInt(clean.slice(colonIdx + 1), 10);
+  let hour       = parseInt(clean.slice(0, colonIdx), 10);
+  const min      = parseInt(clean.slice(colonIdx + 1), 10);
   if (isPm && hour !== 12) hour += 12;
   if (!isPm && hour === 12) hour = 0;
   return hour * 60 + min;
@@ -62,14 +65,27 @@ function pickSection(
   const forSem = all.filter((s) => s.year === sem.year && s.season === sem.season);
   if (forSem.length === 0) return null;
 
+  // Hard-filter sections that violate preferences; fall back to the full pool
+  // only if no compliant section exists for this semester.
+  let pool = forSem;
+  if (prefs.noFridayClasses) {
+    const filtered = pool.filter((s) => !hasFriday(s.days));
+    if (filtered.length > 0) pool = filtered;
+  }
+  if (prefs.avoidEarlyMorning) {
+    const filtered = pool.filter((s) => !isEarlyMorning(s.startTime));
+    if (filtered.length > 0) pool = filtered;
+  }
+
   function score(s: SectionOption): number {
     let penalty = 0;
+    // Remaining tiebreakers in case the fallback pool still violates prefs.
     if (prefs.avoidEarlyMorning && isEarlyMorning(s.startTime)) penalty++;
-    if (prefs.noFridayClasses && hasFriday(s.days)) penalty++;
+    if (prefs.noFridayClasses   && hasFriday(s.days))           penalty++;
     return penalty;
   }
 
-  return forSem.reduce((best, s) => (score(s) < score(best) ? s : best)).id;
+  return pool.reduce((best, s) => (score(s) < score(best) ? s : best)).id;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,12 +290,27 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
 
   // ── 3. Cycle detection ────────────────────────────────────────────────────
 
-  // prereqMap covers ALL courses that may be placed (required + elective + fill)
-  // so that prerequisite checks are enforced for every course, not just required ones.
+  // prereqMap covers ALL courses that may be placed (required + elective + fill).
+  // IMPORTANT: we only enforce prerequisites that the generator actually knows about
+  // (i.e., courses that appear in one of our pools or were completed).  DB data
+  // can include prereqs for courses that are outside the student's plan — if we
+  // enforced those, the course could never be placed because the unknown prereq
+  // is never put in `placedCodes`.  Filtering to "known" codes makes placement
+  // robust without violating any prereq relationship that matters to the plan.
+  const knownCodes = new Set<string>([
+    ...dedupedRequired.map((c) => c.code),
+    ...electivePool.map((c) => c.code),
+    ...(input.fillPool ?? []).map((c) => c.code),
+    ...completedCodes,
+  ]);
+
   const prereqMap = new Map<string, string[]>();
-  for (const c of dedupedRequired)             prereqMap.set(c.code, c.prerequisiteCodes);
-  for (const c of electivePool)                prereqMap.set(c.code, c.prerequisiteCodes);
-  for (const c of (input.fillPool ?? []))      prereqMap.set(c.code, c.prerequisiteCodes);
+  for (const c of dedupedRequired)
+    prereqMap.set(c.code, c.prerequisiteCodes.filter((p) => knownCodes.has(p)));
+  for (const c of electivePool)
+    prereqMap.set(c.code, c.prerequisiteCodes.filter((p) => knownCodes.has(p)));
+  for (const c of (input.fillPool ?? []))
+    prereqMap.set(c.code, c.prerequisiteCodes.filter((p) => knownCodes.has(p)));
 
   if (detectCycle(dedupedRequired.map((c) => c.code), prereqMap)) {
     return {
@@ -319,6 +350,15 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     const key = semKey(sem.year, sem.season);
     semCredits.set(key, 0);
     semCourseList.set(key, []);
+  }
+
+  // Pre-seed credit totals for completed courses that fall inside a planned
+  // semester, so the generator respects the already-used capacity of those slots.
+  for (const cc of completedCourses) {
+    const key = semKey(cc.year, cc.season);
+    if (semCredits.has(key)) {
+      semCredits.set(key, (semCredits.get(key) ?? 0) + cc.credits);
+    }
   }
 
   const placedCodes = new Set<string>(completedCodes);
@@ -408,10 +448,16 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
 
     if (eligible.length === 0) return null;
 
-    // If preferences are set and sections exist, prefer semesters with available sections
+    // If preferences are set and sections exist, prefer semesters that have
+    // sections satisfying the preferences (e.g. no Friday sections).
     const sections = availableSections[course.code] ?? [];
     const pool = (hasPrefs && sections.length > 0)
-      ? eligible.filter((sem) => sections.some((s) => s.year === sem.year && s.season === sem.season))
+      ? eligible.filter((sem) => sections.some((s) => {
+          if (s.year !== sem.year || s.season !== sem.season) return false;
+          if (preferences.noFridayClasses && hasFriday(s.days)) return false;
+          if (preferences.avoidEarlyMorning && isEarlyMorning(s.startTime)) return false;
+          return true;
+        }))
       : [];
     const candidates = pool.length > 0 ? pool : eligible;
 
@@ -492,12 +538,27 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     placeCourse(course, sem);
   }
 
-  // ── 7. Fill with major-specific electives up to electiveCreditsNeeded ─────
+  // ── 7. Fill with major-specific electives ────────────────────────────────
+  // Topologically sort the pool so courses are always processed after their
+  // prerequisite electives have already been placed — preventing a course from
+  // being skipped simply because its prereq elective hadn't been placed yet.
+
+  const electiveSorted = topologicalSort(
+    electivePool.map((c) => c.code),
+    prereqMap,
+    placedCodes  // already-placed required courses count as satisfied
+  );
+  const electiveByCode = new Map(electivePool.map((c) => [c.code, c]));
+  const sortedElectives = [
+    ...electiveSorted.map((code) => electiveByCode.get(code)).filter(Boolean) as GeneratorCourse[],
+    // Any courses not in the topo sort (e.g. no prereqs in pool) go after.
+    ...electivePool.filter((c) => !electiveSorted.includes(c.code)),
+  ];
 
   let electivePlaced = 0;
   const usedElective = new Set<string>();
 
-  for (const elective of electivePool) {
+  for (const elective of sortedElectives) {
     if (electivePlaced >= electiveCreditsNeeded) break;
     if (usedElective.has(elective.code) || placedCodes.has(elective.code)) continue;
 
@@ -507,6 +568,62 @@ export function generateSchedule(input: GeneratorInput): GeneratorResult {
     placeCourse(elective, sem);
     usedElective.add(elective.code);
     electivePlaced += elective.credits;
+  }
+
+  // ── 7b. Retry electives that couldn't be placed (prereqs unresolved) ─────────
+  // On the first pass, prereqsSatisfiedBefore may have blocked some electives
+  // because their own prerequisite electives weren't placed yet.  A second pass
+  // places remaining electives, preferring semesters that come strictly after all
+  // placed prerequisites.  Only if no such semester has capacity do we fall back
+  // to ANY available slot — this way we never introduce a prereq violation unless
+  // it is truly unavoidable given the credit-cap constraints.
+  if (electivePlaced < electiveCreditsNeeded) {
+    for (const elective of sortedElectives) {
+      if (electivePlaced >= electiveCreditsNeeded) break;
+      if (usedElective.has(elective.code) || placedCodes.has(elective.code)) continue;
+
+      // All semesters that have remaining credit capacity.
+      const eligible = plannedSemesters.filter((sem) => {
+        if (!elective.seasons.includes(sem.season)) return false;
+        const key = semKey(sem.year, sem.season);
+        return (semCredits.get(key) ?? 0) + elective.credits <= MAX_SEM_CREDITS;
+      });
+      if (eligible.length === 0) continue;
+
+      // Find the latest semester among those where any known prereq is placed.
+      // We want to place this course STRICTLY after that semester.
+      const prereqs = prereqMap.get(elective.code) ?? [];
+      let lastPrereqSem: PlannedSemester | null = null;
+      for (const prereq of prereqs) {
+        for (const [key, courses] of semCourseList) {
+          if (!courses.some((c) => c.code === prereq)) continue;
+          const dashIdx = key.indexOf("-");
+          const prereqSem: PlannedSemester = {
+            year:   parseInt(key.slice(0, dashIdx), 10),
+            season: key.slice(dashIdx + 1) as Season,
+          };
+          if (lastPrereqSem === null || semIsBefore(lastPrereqSem, prereqSem)) {
+            lastPrereqSem = prereqSem;
+          }
+        }
+      }
+
+      // Prefer semesters strictly after the last prereq; only fall back to any
+      // eligible semester if no such semester has remaining capacity (last resort).
+      const afterPrereq = lastPrereqSem
+        ? eligible.filter((s) => semIsBefore(lastPrereqSem!, s))
+        : eligible;
+      const candidates = afterPrereq.length > 0 ? afterPrereq : eligible;
+
+      const sem = candidates.reduce((best, s) => {
+        const bc = semCredits.get(semKey(best.year, best.season)) ?? 0;
+        const sc = semCredits.get(semKey(s.year, s.season)) ?? 0;
+        return sc < bc ? s : best;
+      });
+      placeCourse(elective, sem);
+      usedElective.add(elective.code);
+      electivePlaced += elective.credits;
+    }
   }
 
   // ── 8. Fill remaining semester capacity with general courses ───────────────
