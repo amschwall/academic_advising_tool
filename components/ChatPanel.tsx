@@ -23,6 +23,8 @@ interface Props {
   completedCourses?: PlannedCourse[];
   /** AP / transfer credits. */
   transferCourses?: PlannedCourse[];
+  /** Called when the user clicks the "+" button on a recommendation card. */
+  onAddCourse?: (course: CatalogEntry) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +90,13 @@ async function consumeSSE(
 // RecommendationCard — draggable via dnd-kit
 // ---------------------------------------------------------------------------
 
-function RecommendationCard({ course }: { course: CatalogEntry }) {
+function RecommendationCard({
+  course,
+  onAdd,
+}: {
+  course: CatalogEntry;
+  onAdd?: (course: CatalogEntry) => void;
+}) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `chat-rec-${course.code}`,
     data: {
@@ -102,24 +110,49 @@ function RecommendationCard({ course }: { course: CatalogEntry }) {
 
   return (
     <div
-      ref={setNodeRef}
-      {...attributes}
-      {...listeners}
       data-testid={`chat-rec-card-${course.code}`}
       className={[
-        "flex cursor-grab select-none items-center justify-between rounded-xl",
+        "flex select-none items-center justify-between rounded-xl",
         "border border-gray-200 bg-white px-3 py-2 shadow-sm transition-all",
-        "active:cursor-grabbing hover:border-green-300 hover:shadow-md",
+        "hover:border-green-300 hover:shadow-md",
         isDragging ? "opacity-40 ring-2 ring-green-400" : "",
       ].join(" ")}
     >
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-semibold text-gray-800">{course.code}</p>
-        <p className="truncate text-xs text-gray-500">{course.title}</p>
+      {/* Drag handle — only this part initiates the drag */}
+      <div
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
+        className="flex min-w-0 flex-1 cursor-grab items-center gap-2 active:cursor-grabbing"
+      >
+        {/* Drag grip icon */}
+        <svg className="h-3.5 w-3.5 shrink-0 text-gray-300" fill="currentColor" viewBox="0 0 20 20">
+          <path d="M7 2a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm0 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm0 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm6-16a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm0 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm0 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/>
+        </svg>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-gray-800">{course.code}</p>
+          <p className="truncate text-xs text-gray-500">{course.title}</p>
+        </div>
       </div>
-      <span className="ml-3 shrink-0 rounded-md bg-gray-100 px-1.5 py-0.5 text-xs font-medium text-gray-600">
-        {course.credits} cr
-      </span>
+
+      <div className="ml-3 flex shrink-0 items-center gap-2">
+        <span className="rounded-md bg-gray-100 px-1.5 py-0.5 text-xs font-medium text-gray-600">
+          {course.credits} cr
+        </span>
+        {/* Click-to-add button — works independently of drag */}
+        {onAdd && (
+          <button
+            onClick={() => onAdd(course)}
+            title="Add to selected semester"
+            className="flex h-6 w-6 items-center justify-center rounded-full bg-green-100
+                       text-green-700 transition-colors hover:bg-green-700 hover:text-white"
+          >
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+            </svg>
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -150,6 +183,7 @@ export function ChatPanel({
   courseCatalog    = [],
   completedCourses = [],
   transferCourses  = [],
+  onAddCourse,
 }: Props) {
   const [input, setInput] = React.useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -197,7 +231,12 @@ export function ChatPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextMessages,
-          context: { plannedCourses, completedCourses, transferCourses },
+          context: {
+            catalog: courseCatalog,
+            plannedCourses,
+            completedCourses,
+            transferCourses,
+          },
         }),
       });
 
@@ -300,7 +339,7 @@ export function ChatPanel({
                 {recs.length > 0 && (
                   <div className="space-y-2 pl-1">
                     {recs.map((course) => (
-                      <RecommendationCard key={course.code} course={course} />
+                      <RecommendationCard key={course.code} course={course} onAdd={onAddCourse} />
                     ))}
                   </div>
                 )}

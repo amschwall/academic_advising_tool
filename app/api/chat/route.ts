@@ -24,6 +24,8 @@ interface RequestBody {
     plannedCourses?:   CourseContext[];
     completedCourses?: CourseContext[];
     transferCourses?:  CourseContext[];
+    /** Full course catalog available to this student. */
+    catalog?:          CourseContext[];
   };
 }
 
@@ -35,11 +37,15 @@ const SYSTEM_PROMPT =
   "You are an academic advisor at William & Mary (W&M). " +
   "Your role is to help students choose courses and declare majors that align with " +
   "their interests, goals, and degree requirements.\n\n" +
+  "IMPORTANT: You will be given the complete list of courses available to this student. " +
+  "You MUST only recommend courses that appear in that list. " +
+  "Never invent course codes or titles. If a student asks about a subject where no " +
+  "matching course exists in the catalog, say so honestly rather than fabricating one.\n\n" +
   "When a student's query is too vague to give specific recommendations, ask one " +
   "clarifying question before proceeding.\n\n" +
-  "When the query is specific enough, recommend relevant courses and suggest majors. " +
-  "Always include the course code (e.g. CSCI303, MATH211) when mentioning a specific " +
-  "course so the student can identify it in their planner. Keep responses concise.";
+  "When the query is specific enough, recommend relevant courses from the catalog and suggest majors. " +
+  "Always include the exact course code (e.g. CSCI303, MATH211) and exact title when mentioning a " +
+  "specific course so the student can identify it in their planner. Keep responses concise.";
 
 // ---------------------------------------------------------------------------
 // Build context note appended to the first user turn
@@ -48,22 +54,34 @@ const SYSTEM_PROMPT =
 function buildContextNote(ctx: RequestBody["context"]): string {
   if (!ctx) return "";
   const lines: string[] = [];
+
+  // Catalog comes first so the model knows what it's allowed to recommend.
+  if (ctx.catalog?.length) {
+    const catalogStr = ctx.catalog
+      .map((c) => `${c.code} — ${c.title} (${c.credits} cr)`)
+      .join("\n");
+    lines.push(`[Available course catalog]\n${catalogStr}`);
+  }
+
+  const studentLines: string[] = [];
   if (ctx.completedCourses?.length) {
-    lines.push(
+    studentLines.push(
       "Completed: " + ctx.completedCourses.map((c) => `${c.code} ${c.title}`).join(", "),
     );
   }
   if (ctx.transferCourses?.length) {
-    lines.push(
+    studentLines.push(
       "Transfer/AP: " + ctx.transferCourses.map((c) => `${c.code} ${c.title}`).join(", "),
     );
   }
   if (ctx.plannedCourses?.length) {
-    lines.push(
+    studentLines.push(
       "Currently planned: " + ctx.plannedCourses.map((c) => `${c.code} ${c.title}`).join(", "),
     );
   }
-  return lines.length ? "\n\n[Student context]\n" + lines.join("\n") : "";
+  if (studentLines.length) lines.push("[Student context]\n" + studentLines.join("\n"));
+
+  return lines.length ? "\n\n" + lines.join("\n\n") : "";
 }
 
 // ---------------------------------------------------------------------------
