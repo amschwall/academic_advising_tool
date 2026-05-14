@@ -21,10 +21,13 @@ const MAX_SEMESTER_CREDITS = 18;
 const MIN_SEMESTER_CREDITS = 12;
 const GRADUATION_CREDITS   = 120;
 
+// Academic-year convention: Fall is the start of each year, Spring follows.
+// This matches the planner store's year numbering (Year 1 Fall → Year 1 Spring
+// → Year 2 Fall → ...) where Fall and Spring share the same `year` value.
 const SEASON_ORDER: Record<Season, number> = {
-  SPRING: 0,
-  SUMMER: 1,
-  FALL:   2,
+  FALL:   0,
+  SPRING: 1,
+  SUMMER: 2,
   WINTER: 3,
 };
 

@@ -7,7 +7,7 @@
  *
  * Conventions:
  *  - collAttribute values use the normalised "COLL 100" format (as stored in the DB).
- *  - Season ordering within a year: SPRING < SUMMER < FALL < WINTER.
+ *  - Season ordering within a year: FALL < SPRING < SUMMER < WINTER (academic-year convention).
  *  - Prerequisite "satisfied" means completed with a passing grade OR, for future
  *    planning, placed in a strictly earlier semester.
  *  - Per-semester credit limits: min = 12, max = 18 (W&M defaults).
