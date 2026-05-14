@@ -24,6 +24,11 @@ export interface PlannedCourse {
   department?: string;
   /** Tracks whether the course has been completed, is in progress, or just planned. */
   status?: CourseStatus;
+  /** Recorded grade, e.g. "A", "B+". Only present for completed courses. */
+  grade?: string | null;
+  /** Semester placement — set by loadSchedule so RequirementsView can display the term. */
+  year?: number;
+  season?: "FALL" | "SPRING" | "SUMMER" | "WINTER";
 }
 
 export interface Semester {
@@ -55,6 +60,8 @@ interface PlannerStore {
   clearAllCourses: () => void;
   clearPendingChanges: () => void;
   reset: () => void;
+  /** Populate semesters from DB without creating pending changes */
+  loadSchedule: (items: Array<{ year: number; season: "FALL" | "SPRING"; course: PlannedCourse; completed: boolean; grade?: string | null }>) => void;
 
   // Derived queries — callable anywhere (store functions use get() internally)
   isPrereqSatisfied: (semesterId: string, course: PlannedCourse) => boolean;
@@ -182,6 +189,24 @@ export const usePlannerStore = create<PlannerStore>((set, get) => ({
   clearPendingChanges: () => set({ pendingChanges: [] }),
 
   reset: () => set({ semesters: makeDefaultSemesters(), pendingChanges: [] }),
+
+  loadSchedule: (items) => {
+    set((state) => ({
+      semesters: state.semesters.map((sem) => ({
+        ...sem,
+        courses: items
+          .filter((item) => item.year === sem.year && item.season === sem.season)
+          .map((item) => ({
+            ...item.course,
+            status: (item.completed ? "completed" : "planned") as CourseStatus,
+            grade:  item.grade ?? null,
+            year:   sem.year,
+            season: sem.season,
+          })),
+      })),
+      pendingChanges: [],
+    }));
+  },
 
   // ── isPrereqSatisfied ─────────────────────────────────────────────────────
   // A course's prereqs are satisfied if every prereq code appears in a semester

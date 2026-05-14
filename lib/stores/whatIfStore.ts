@@ -14,6 +14,8 @@ interface WhatIfStore {
   active: boolean;
   /** Major being explored, or null. */
   major: string | null;
+  /** Second major being explored, or null. */
+  secondMajor: string | null;
   /** Minor being explored, or null. */
   minor: string | null;
   /** Concentration being explored, or null. */
@@ -38,6 +40,7 @@ interface WhatIfStore {
 
   // Selections
   setMajor: (major: string | null) => void;
+  setSecondMajor: (secondMajor: string | null) => void;
   setMinor: (minor: string | null) => void;
   setConcentration: (concentration: string | null) => void;
 
@@ -53,6 +56,7 @@ export const useWhatIfStore = create<WhatIfStore>((set) => ({
   open:                 false,
   active:               false,
   major:                null,
+  secondMajor:          null,
   minor:                null,
   concentration:        null,
   mode:                 null,
@@ -73,11 +77,12 @@ export const useWhatIfStore = create<WhatIfStore>((set) => ({
   deactivate: () => set({ active: false, mode: null }),
 
   setMajor:         (major)         => set({ major }),
+  setSecondMajor:   (secondMajor)   => set({ secondMajor }),
   setMinor:         (minor)         => set({ minor }),
   setConcentration: (concentration) => set({ concentration }),
 
   reset: () => set({
-    open: false, active: false, major: null, minor: null,
-    concentration: null, mode: null, generateTriggerCount: 0,
+    open: false, active: false, major: null, secondMajor: null,
+    minor: null, concentration: null, mode: null, generateTriggerCount: 0,
   }),
 }));
