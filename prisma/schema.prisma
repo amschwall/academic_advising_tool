@@ -36,6 +36,7 @@ model Student {
   email         String     @unique
   name          String
   major         String?    @default("Undecided")
+  secondMajor   String?
   minor         String?
   concentration String?
   year          Int?
